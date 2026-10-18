@@ -22,9 +22,9 @@
     <section class="card" aria-labelledby="connect-title">
       <h2 id="connect-title">Connexion</h2>
       <ol class="steps">
-        <li>Ferme complètement l'appli Segway (balaye-la hors de l'écran) : une seule appli peut être connectée à la fois.</li>
+        <li>Ferme complètement les autres applis de trottinette (Segway, ScooterHacking…) : tant qu'une appli est connectée, la trottinette n'apparaît nulle part ailleurs.</li>
         <li>Allume la trottinette.</li>
-        <li>Appuie sur « Connecter », puis choisis ta trottinette dans la liste.</li>
+        <li>Appuie sur « Connecter ». Dans la liste, ta trottinette s'affiche avec son <strong>numéro de série</strong> (14 caractères, ex. <code>1K1UA2532P0220</code>)<span id="last-name-hint"></span>.</li>
         <li>La première fois seulement, appuie brièvement sur le bouton Power de la trottinette quand le site te le demande.</li>
       </ol>
       <div class="row">
@@ -33,9 +33,8 @@
       </div>
       <details class="advanced">
         <summary>Options avancées</summary>
-        <label class="inline"><input id="show-all" type="checkbox"> Afficher tous les appareils Bluetooth (si la trottinette n'apparaît pas)</label>
         <label for="name-override">Nom Bluetooth (si la connexion échoue)</label>
-        <input id="name-override" type="text" autocomplete="off" autocapitalize="characters" spellcheck="false" placeholder="Numéro de série, ex. 03GGG2539C0023">
+        <input id="name-override" type="text" autocomplete="off" autocapitalize="characters" spellcheck="false" placeholder="Numéro de série, ex. 1K1UA2532P0220">
         <p class="hint">Ce nom sert de clé de chiffrement. Laisse vide pour utiliser le nom détecté.</p>
         <button id="btn-forget" class="btn btn-small" type="button">Oublier l'appairage enregistré</button>
       </details>

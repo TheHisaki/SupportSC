@@ -6,7 +6,7 @@ import {
 } from './shortcuts.js';
 
 // Bumped on every deploy so you can check the phone shows the latest version.
-const APP_VERSION = '1.1.1';
+const APP_VERSION = '1.2.0';
 
 const $ = (id) => document.getElementById(id);
 
@@ -17,7 +17,7 @@ const ui = {
   disconnect: $('btn-disconnect'),
   forget: $('btn-forget'),
   nameOverride: $('name-override'),
-  showAll: $('show-all'),
+  lastNameHint: $('last-name-hint'),
   dashboard: $('dashboard'),
   refresh: $('btn-refresh'),
   battery: $('stat-battery'),
@@ -144,13 +144,11 @@ async function refreshDashboard() {
 
 ui.connect.addEventListener('click', () => withBusy(ui.connect, async () => {
   try {
-    await scooter.connect({ nameOverride: ui.nameOverride.value, showAll: ui.showAll.checked });
+    await scooter.connect({ nameOverride: ui.nameOverride.value });
   } catch (err) {
     if (err.name === 'NotFoundError') { // picker closed or no device chosen
       log('info', 'Aucune trottinette choisie.');
-      if (!ui.showAll.checked) {
-        toast("Trottinette introuvable ? Coche « Afficher tous les appareils » dans les options avancées.", 'error');
-      }
+      toast("Pas dans la liste ? Ferme les autres applis de trottinette, rallume-la et réessaie.", 'error');
       return;
     }
     if (err.name === 'SecurityError') {
@@ -159,6 +157,7 @@ ui.connect.addEventListener('click', () => withBusy(ui.connect, async () => {
     throw err;
   }
   toast('Trottinette connectée');
+  showLastNameHint();
   updateConnectionUi();
   await refreshDashboard();
 }));
@@ -265,6 +264,12 @@ if (!Scooter.isSupported()) {
   log('warn', 'Web Bluetooth non disponible dans ce navigateur.');
 }
 
+function showLastNameHint() {
+  const name = Scooter.lastScooterName();
+  ui.lastNameHint.textContent = name ? ` — la tienne : ${name}` : '';
+}
+
 $('app-version').textContent = APP_VERSION;
+showLastNameHint();
 renderShortcuts();
 log('info', `Prêt (version ${APP_VERSION}).`);

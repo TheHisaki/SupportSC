@@ -79,29 +79,31 @@ export class Scooter extends EventTarget {
   }
 
   /**
-   * Opens the browser's Bluetooth picker. By default it only lists Segway/Ninebot devices
-   * (Ninebot service UUID or Ninebot manufacturer id); `showAll` lists every nearby device.
+   * Opens the browser's Bluetooth picker with every nearby device.
+   * Segway "x3" scooters (ZT3, GT3, G3, F3) advertise only their serial number as name
+   * (e.g. "1K1UA2532P0220"), without the Ninebot service UUID, so service filters hide them.
    */
-  async _pickDevice(showAll) {
-    const optionalServices = [NB_SERVICE, NORDIC_SERVICE];
-    if (showAll) return navigator.bluetooth.requestDevice({ acceptAllDevices: true, optionalServices });
-
-    const serviceFilters = [{ services: [NB_SERVICE] }, { services: [NORDIC_SERVICE] }];
-    const mfrFilters = NINEBOT_COMPANY_IDS.map((companyIdentifier) => ({ manufacturerData: [{ companyIdentifier }] }));
-    try {
-      return await navigator.bluetooth.requestDevice({ filters: [...serviceFilters, ...mfrFilters], optionalServices });
-    } catch (err) {
-      // Browsers without manufacturer-data filters reject the whole request with a TypeError.
+  async _pickDevice() {
+    return navigator.bluetooth.requestDevice({
+      acceptAllDevices: true,
+      optionalServices: [NB_SERVICE, NORDIC_SERVICE],
+      optionalManufacturerData: NINEBOT_COMPANY_IDS,
+    }).catch((err) => {
+      // Older engines reject the unknown optionalManufacturerData option.
       if (err.name !== 'TypeError') throw err;
-      this.log('debug', 'Filtre fabricant non supporté, filtre par service uniquement.');
-      return navigator.bluetooth.requestDevice({ filters: serviceFilters, optionalServices });
-    }
+      return navigator.bluetooth.requestDevice({ acceptAllDevices: true, optionalServices: [NB_SERVICE, NORDIC_SERVICE] });
+    });
+  }
+
+  /** Name of the last scooter that authenticated successfully (shown as a hint in the UI). */
+  static lastScooterName() {
+    return storage.get('zt3:last-name') ?? '';
   }
 
   /** Opens the device picker, connects and authenticates. Must be called from a user gesture. */
-  async connect({ nameOverride = '', showAll = false } = {}) {
+  async connect({ nameOverride = '' } = {}) {
     this._progress('Recherche…');
-    const device = await this._pickDevice(showAll);
+    const device = await this._pickDevice();
     if (this.device) {
       await this._closeGatt();
       this.device.removeEventListener('gattserverdisconnected', this._onDisconnected);
@@ -133,6 +135,7 @@ export class Scooter extends EventTarget {
         this._progress('Sécurisation…');
         await this._handshake(variant);
         storage.set(`zt3:variant:${this.btName}`, variant.id);
+        storage.set('zt3:last-name', this.btName);
         this.connected = true;
         this.dispatchEvent(new Event('connected'));
         return;
