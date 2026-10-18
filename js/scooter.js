@@ -53,7 +53,12 @@ export class Scooter extends EventTarget {
     this.log = log ?? (() => {});
     this.device = null;
     this.writeChar = null;
-    this.notifyChar = null;
+    this.notifyChars = [];
+    this._assemblers = null;
+    this._gattLost = false;
+    this._t0 = 0;
+    this._step = 'inactif';
+    this._lastRx = null;
     this.crypto = null;
     this.sync2 = 0xa5;
     this.btName = '';
@@ -117,43 +122,66 @@ export class Scooter extends EventTarget {
     }
     this.log('info', `Appareil choisi : ${device.name ?? '(sans nom)'} — clé utilisée : "${this.btName}"`);
 
+    this.log('info', `Navigateur : ${navigator.userAgent}`);
+
     const preferred = storage.get(`zt3:variant:${this.btName}`);
-    const plan = preferred === 'gen3'
-      ? [VARIANTS.gen3, VARIANTS.gen3, VARIANTS.gen2]
-      : [VARIANTS.gen2, VARIANTS.gen2, VARIANTS.gen3];
+    const main = preferred === 'gen3' ? VARIANTS.gen3 : VARIANTS.gen2;
+    const other = main === VARIANTS.gen2 ? VARIANTS.gen3 : VARIANTS.gen2;
+    // The other variant is only tried when the scooter answers with nothing usable (echo / silence),
+    // never after a plain disconnect (that is a link problem, not a key problem).
+    const MAX_ATTEMPTS = 4;
 
     let lastError = null;
-    for (let attempt = 0; attempt < plan.length; attempt++) {
-      const variant = plan[attempt];
+    let variant = main;
+    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
       try {
-        if (attempt > 0) {
+        if (attempt > 1) {
           await this._closeGatt();
-          await sleep(1000 * attempt);
+          await sleep(700 * (attempt - 1));
         }
-        this._progress('Connexion…');
-        await this._openGatt();
+        this._progress(attempt > 1 ? `Connexion… (essai ${attempt}/${MAX_ATTEMPTS})` : 'Connexion…');
+        // Toggle CCCD only on retries: it costs time and the scooter drops slow clients.
+        await this._openGatt({ toggleCccd: attempt > 1 });
         this._progress('Sécurisation…');
         await this._handshake(variant);
         storage.set(`zt3:variant:${this.btName}`, variant.id);
         storage.set('zt3:last-name', this.btName);
         this.connected = true;
+        this._step = 'connecté';
         this.dispatchEvent(new Event('connected'));
         return;
-      } catch (err) {
+      } catch (rawErr) {
+        const err = this._normalizeError(rawErr);
         lastError = err;
-        const retryable = err instanceof ScooterError && (err.code === 'ECHO' || err.code === 'TIMEOUT');
-        this.log('warn', `Tentative ${attempt + 1}/${plan.length} (${variant.id}) : ${err.message}`);
+        this.log('warn', `Essai ${attempt}/${MAX_ATTEMPTS} (${variant.id}, étape « ${this._step} ») : ${err.message}`);
+        const retryable = err instanceof ScooterError && ['ECHO', 'TIMEOUT', 'DISCONNECTED'].includes(err.code);
         if (!retryable) break;
+        if (err.code !== 'DISCONNECTED' && attempt >= 2) variant = other;
       }
     }
 
     await this._closeGatt();
-    if (lastError instanceof ScooterError && (lastError.code === 'ECHO' || lastError.code === 'TIMEOUT')) {
+    if (lastError?.code === 'DISCONNECTED') {
+      throw new ScooterError('DISCONNECTED',
+        "La trottinette coupe la connexion avant la fin de l'appairage. Ferme complètement ScooterHacking Utility " +
+        "et l'appli Segway, éteins puis rallume la trottinette, et réessaie. Si ça continue, envoie-moi le journal technique.");
+    }
+    if (lastError?.code === 'ECHO' || lastError?.code === 'TIMEOUT') {
       throw new ScooterError(lastError.code,
-        "La trottinette n'a pas accepté la connexion. Vérifie que l'appli Segway est complètement fermée, " +
-        "que la trottinette est allumée, et que le nom Bluetooth correspond au numéro de série.");
+        "La trottinette n'a pas répondu à l'appairage. Ferme les autres applis de trottinette, rallume-la et réessaie. " +
+        "Si ça continue, envoie-moi le journal technique.");
     }
     throw lastError;
+  }
+
+  /** Maps browser Bluetooth errors (e.g. "GATT Server is disconnected") to ScooterError codes. */
+  _normalizeError(err) {
+    if (err instanceof ScooterError) return err;
+    const msg = String(err?.message ?? err);
+    if (this._gattLost || err?.name === 'NetworkError' || /disconnect|not connected|déconnect/i.test(msg)) {
+      return new ScooterError('DISCONNECTED', `Connexion coupée par la trottinette (${msg}).`);
+    }
+    return err;
   }
 
   async disconnect() {
@@ -162,16 +190,32 @@ export class Scooter extends EventTarget {
     this.dispatchEvent(new Event('disconnected'));
   }
 
-  async _openGatt() {
+  _elapsed() {
+    return `${((performance.now() - this._t0) / 1000).toFixed(2)} s`;
+  }
+
+  _mark(step) {
+    this._step = step;
+    this.log('info', `[${this._elapsed()}] ${step}`);
+  }
+
+  async _openGatt({ toggleCccd = false } = {}) {
     this._expectDisconnect = false;
+    this._gattLost = false;
+    this._t0 = performance.now();
+    this._rxQueue = [];
+    this._lastRx = null;
+    this._mark('connexion GATT');
     const server = await this.device.gatt.connect();
+    this._mark('GATT connecté, recherche du service');
 
     let service;
     let writeUuid = NB_WRITE;
     let notifyUuid = NB_NOTIFY;
     try {
       service = await server.getPrimaryService(NB_SERVICE);
-    } catch {
+    } catch (err) {
+      if (this._gattLost || err?.name !== 'NotFoundError') throw err;
       service = await server.getPrimaryService(NORDIC_SERVICE);
       writeUuid = NORDIC_WRITE;
       notifyUuid = NORDIC_NOTIFY;
@@ -179,30 +223,48 @@ export class Scooter extends EventTarget {
     }
 
     this.writeChar = await service.getCharacteristic(writeUuid);
-    if (this.notifyChar) this.notifyChar.removeEventListener('characteristicvaluechanged', this._onNotify);
-    this.notifyChar = await service.getCharacteristic(notifyUuid);
-    this.notifyChar.addEventListener('characteristicvaluechanged', this._onNotify);
-    await this.notifyChar.startNotifications();
+    const notifyChars = [await service.getCharacteristic(notifyUuid)];
 
-    // iOS keeps CCCD state between connections: toggle it, then drain stale notifications.
-    try {
-      await this.notifyChar.stopNotifications();
-      await sleep(300);
-      await this.notifyChar.startNotifications();
-    } catch (err) {
-      this.log('debug', `Toggle notifications ignoré : ${err.message}`);
+    // Segway apps also listen on the legacy Nordic UART notify characteristic: some boards answer there.
+    if (notifyUuid !== NORDIC_NOTIFY) {
+      try {
+        const legacy = await server.getPrimaryService(NORDIC_SERVICE);
+        notifyChars.push(await legacy.getCharacteristic(NORDIC_NOTIFY));
+      } catch (err) {
+        if (this._gattLost) throw err;
+        this.log('debug', 'Pas de service Nordic UART (normal sur certains modèles).');
+      }
     }
-    await sleep(200);
-    this._assembler.reset();
+    this._mark(`caractéristiques trouvées (${notifyChars.length} canal${notifyChars.length > 1 ? 'aux' : ''} de réponse)`);
+
+    for (const ch of this.notifyChars ?? []) ch.removeEventListener('characteristicvaluechanged', this._onNotify);
+    this.notifyChars = notifyChars;
+    this._assemblers = new Map(notifyChars.map((ch) => [ch, new FrameAssembler((f) => this._onFrame(f))]));
+    for (const ch of notifyChars) {
+      ch.addEventListener('characteristicvaluechanged', this._onNotify);
+      await ch.startNotifications();
+      if (toggleCccd) {
+        // iOS keeps CCCD state between connections: toggle it to get a clean subscription.
+        try {
+          await ch.stopNotifications();
+          await sleep(150);
+          await ch.startNotifications();
+        } catch (err) {
+          if (this._gattLost) throw err;
+          this.log('debug', `Toggle notifications ignoré : ${err.message}`);
+        }
+      }
+    }
+    await sleep(toggleCccd ? 200 : 50); // drain stale notifications from a previous session
     this._rxQueue = [];
-    this.log('debug', 'GATT connecté, notifications actives.');
+    this._mark('notifications actives');
   }
 
   async _closeGatt() {
     this._expectDisconnect = true;
-    try {
-      if (this.notifyChar) await this.notifyChar.stopNotifications();
-    } catch { /* already disconnected */ }
+    for (const ch of this.notifyChars ?? []) {
+      try { await ch.stopNotifications(); } catch { /* already disconnected */ }
+    }
     if (this.device?.gatt?.connected) this.device.gatt.disconnect();
     this.connected = false;
   }
@@ -210,9 +272,12 @@ export class Scooter extends EventTarget {
   _onDisconnected() {
     const wasConnected = this.connected;
     this.connected = false;
+    this._gattLost = true;
+    if (!this._expectDisconnect && this._t0) {
+      this.log('warn', `[${this._elapsed()}] La trottinette a coupé la connexion (étape « ${this._step} »).`);
+    }
     if (this._rxWaiter) this._rxWaiter.reject(new ScooterError('DISCONNECTED', 'Connexion Bluetooth perdue.'));
     if (!this._expectDisconnect && wasConnected) {
-      this.log('warn', 'La trottinette s\'est déconnectée.');
       this.dispatchEvent(new Event('disconnected'));
     }
   }
@@ -221,10 +286,16 @@ export class Scooter extends EventTarget {
 
   _onNotify(event) {
     const v = event.target.value;
-    this._assembler.push(new Uint8Array(v.buffer, v.byteOffset, v.byteLength).slice());
+    const chunk = new Uint8Array(v.buffer, v.byteOffset, v.byteLength).slice();
+    this.log('debug', `notif ${event.target.uuid?.slice(4, 8) ?? '?'} (${chunk.length} o)`);
+    (this._assemblers?.get(event.target) ?? this._assembler).push(chunk);
   }
 
   _onFrame(frame) {
+    // The same frame may arrive on both notify channels: keep only one copy.
+    const now = performance.now();
+    if (this._lastRx && now - this._lastRx.at < 500 && bytesEqual(this._lastRx.frame, frame)) return;
+    this._lastRx = { frame, at: now };
     this.log('debug', `RX ${toHex(frame)}`);
     if (this._rxWaiter) {
       const { resolve } = this._rxWaiter;
@@ -237,6 +308,7 @@ export class Scooter extends EventTarget {
 
   _nextFrame(timeoutMs) {
     if (this._rxQueue.length) return Promise.resolve(this._rxQueue.shift());
+    if (this._gattLost) return Promise.reject(new ScooterError('DISCONNECTED', 'Connexion Bluetooth perdue.'));
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         this._rxWaiter = null;
@@ -250,6 +322,7 @@ export class Scooter extends EventTarget {
   }
 
   async _write(bytes) {
+    if (this._gattLost) throw new ScooterError('DISCONNECTED', 'Connexion Bluetooth perdue.');
     this.log('debug', `TX ${toHex(bytes)}`);
     const ch = this.writeChar;
     for (let off = 0; off < bytes.length; off += CHUNK_SIZE) {
@@ -308,7 +381,7 @@ export class Scooter extends EventTarget {
     const name = utf8(this.btName);
 
     // Phase 1: PRE_COMM (non-SN mode)
-    this.log('info', `Handshake ${variant.id} : PRE_COMM…`);
+    this._mark(`PRE_COMM envoyé (${variant.id})`);
     crypto.resetSn();
     crypto.setKey(name, variant.key2);
     const pre = await this._transact(
@@ -321,7 +394,7 @@ export class Scooter extends EventTarget {
     const auth = pre.data.slice(0, 16);
     const sn = pre.data.slice(16, 30);
     this.serial = ascii(sn);
-    this.log('info', `Numéro de série : ${this.serial}`);
+    this._mark(`PRE_COMM reçu — n° de série ${this.serial}${pre.index ? ', déjà appairée à une autre appli' : ''}`);
     crypto.setAuthParam(auth);
     crypto.startSn();
 
@@ -346,7 +419,7 @@ export class Scooter extends EventTarget {
   }
 
   async _setPassword(name, auth) {
-    this.log('info', 'SET_PWD : envoi d\'un nouveau mot de passe de session…');
+    this._mark('SET_PWD envoyé (nouvel appairage)');
     this.crypto.setKey(name, auth);
     const password = randomBytes(16);
     const frame = buildFrame(this.sync2, BOARD.BLE, CMD.SET_PWD, 0x00, password);
@@ -379,6 +452,7 @@ export class Scooter extends EventTarget {
   }
 
   async _auth(password, auth, sn) {
+    this._mark('AUTH envoyé');
     this.crypto.setKey(password, auth);
     const resp = await this._transact(
       buildFrame(this.sync2, BOARD.BLE, CMD.AUTH, 0x00, sn),
