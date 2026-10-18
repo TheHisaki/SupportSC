@@ -3,7 +3,6 @@
 
 import { NbCrypto, FW_DATA, bytesEqual, fromHex, randomBytes, toHex } from './crypto.js';
 import { CMD, FrameAssembler, buildFrame, parseFrame, readU16, u16le } from './protocol.js';
-import { BOARD } from './registers.js';
 
 const NB_SERVICE = '6e400001-0000-0000-006e-696e65626f74';
 const NB_WRITE = '6e400002-0000-0000-006e-696e65626f74';
@@ -12,11 +11,15 @@ const NORDIC_SERVICE = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
 const NORDIC_WRITE = '6e400002-b5a3-f393-e0a9-e50e24dcca9e';
 const NORDIC_NOTIFY = '6e400003-b5a3-f393-e0a9-e50e24dcca9e';
 
-// Gen2 is the variant verified against a GT3 Pro capture (same "x3" platform as the ZT3 Pro).
-const VARIANTS = {
-  gen2: { id: 'gen2', sync2: 0xa5, key2: FW_DATA, ecb: FW_DATA },
-  gen3: { id: 'gen3', sync2: 0xb5, key2: null, ecb: null },
-};
+// Pairing flow ported from the official Segway app logic for "x3" scooters (G3, GT3, ZT3), see
+// https://github.com/HeckerHeckt/Ninebot-Max-G3-Firmware-Flasher (ninebot_ble.py):
+//  - frames go over the Nordic UART characteristics,
+//  - pairing target is the BLE board 0x04 for names starting with "1CG", else 0x21,
+//  - the message counter follows the scooter, SET_PWD / AUTH are resent every 0.5 s.
+const SYNC2 = 0xa5;
+const BLE_BOARD_NEW = 0x04;
+const BLE_BOARD_LEGACY = 0x21;
+const RESEND_MS = 500;
 
 // Ninebot/Segway company ids found in BLE advertisements (both byte orders are seen in the wild).
 const NINEBOT_COMPANY_IDS = [0x4e42, 0x4e43, 0x424e, 0x434e];
@@ -53,14 +56,16 @@ export class Scooter extends EventTarget {
     this.log = log ?? (() => {});
     this.device = null;
     this.writeChar = null;
+    this.channels = [];
     this.notifyChars = [];
+    this.peer = BLE_BOARD_LEGACY;
     this._assemblers = null;
     this._gattLost = false;
     this._t0 = 0;
     this._step = 'inactif';
     this._lastRx = null;
     this.crypto = null;
-    this.sync2 = 0xa5;
+    this.sync2 = SYNC2;
     this.btName = '';
     this.serial = '';
     this.connected = false;
@@ -124,15 +129,8 @@ export class Scooter extends EventTarget {
 
     this.log('info', `Navigateur : ${navigator.userAgent}`);
 
-    const preferred = storage.get(`zt3:variant:${this.btName}`);
-    const main = preferred === 'gen3' ? VARIANTS.gen3 : VARIANTS.gen2;
-    const other = main === VARIANTS.gen2 ? VARIANTS.gen3 : VARIANTS.gen2;
-    // The other variant is only tried when the scooter answers with nothing usable (echo / silence),
-    // never after a plain disconnect (that is a link problem, not a key problem).
     const MAX_ATTEMPTS = 4;
-
     let lastError = null;
-    let variant = main;
     for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
       try {
         if (attempt > 1) {
@@ -143,8 +141,7 @@ export class Scooter extends EventTarget {
         // Toggle CCCD only on retries: it costs time and the scooter drops slow clients.
         await this._openGatt({ toggleCccd: attempt > 1 });
         this._progress('Sécurisation…');
-        await this._handshake(variant);
-        storage.set(`zt3:variant:${this.btName}`, variant.id);
+        await this._handshake();
         storage.set('zt3:last-name', this.btName);
         this.connected = true;
         this._step = 'connecté';
@@ -153,10 +150,9 @@ export class Scooter extends EventTarget {
       } catch (rawErr) {
         const err = this._normalizeError(rawErr);
         lastError = err;
-        this.log('warn', `Essai ${attempt}/${MAX_ATTEMPTS} (${variant.id}, étape « ${this._step} ») : ${err.message}`);
-        const retryable = err instanceof ScooterError && ['ECHO', 'TIMEOUT', 'DISCONNECTED'].includes(err.code);
+        this.log('warn', `Essai ${attempt}/${MAX_ATTEMPTS} (étape « ${this._step} ») : ${err.message}`);
+        const retryable = err instanceof ScooterError && ['ECHO', 'TIMEOUT', 'DISCONNECTED', 'AUTH_STALE'].includes(err.code);
         if (!retryable) break;
-        if (err.code !== 'DISCONNECTED' && attempt >= 2) variant = other;
       }
     }
 
@@ -209,39 +205,37 @@ export class Scooter extends EventTarget {
     const server = await this.device.gatt.connect();
     this._mark('GATT connecté, recherche du service');
 
-    let service;
-    let writeUuid = NB_WRITE;
-    let notifyUuid = NB_NOTIFY;
-    try {
-      service = await server.getPrimaryService(NB_SERVICE);
-    } catch (err) {
-      if (this._gattLost || err?.name !== 'NotFoundError') throw err;
-      service = await server.getPrimaryService(NORDIC_SERVICE);
-      writeUuid = NORDIC_WRITE;
-      notifyUuid = NORDIC_NOTIFY;
-      this.log('warn', 'Service Ninebot introuvable, utilisation du service Nordic UART.');
-    }
-
-    this.writeChar = await service.getCharacteristic(writeUuid);
-    const notifyChars = [await service.getCharacteristic(notifyUuid)];
-
-    // Segway apps also listen on the legacy Nordic UART notify characteristic: some boards answer there.
-    if (notifyUuid !== NORDIC_NOTIFY) {
+    // The official app talks to x3 scooters over Nordic UART; the Ninebot service is a backup channel.
+    const channels = [];
+    for (const [label, svcUuid, writeUuid, notifyUuid] of [
+      ['Nordic', NORDIC_SERVICE, NORDIC_WRITE, NORDIC_NOTIFY],
+      ['Ninebot', NB_SERVICE, NB_WRITE, NB_NOTIFY],
+    ]) {
       try {
-        const legacy = await server.getPrimaryService(NORDIC_SERVICE);
-        notifyChars.push(await legacy.getCharacteristic(NORDIC_NOTIFY));
+        const svc = await server.getPrimaryService(svcUuid);
+        channels.push({
+          label,
+          write: await svc.getCharacteristic(writeUuid),
+          notify: await svc.getCharacteristic(notifyUuid),
+        });
       } catch (err) {
         if (this._gattLost) throw err;
-        this.log('debug', 'Pas de service Nordic UART (normal sur certains modèles).');
+        this.log('debug', `Service ${label} absent (${err.message}).`);
       }
     }
-    this._mark(`caractéristiques trouvées (${notifyChars.length} canal${notifyChars.length > 1 ? 'aux' : ''} de réponse)`);
+    if (!channels.length) throw new ScooterError('PROTOCOL', 'Aucun service Bluetooth Segway trouvé sur cet appareil.');
+    this.channels = channels;
+    this.writeChar = channels[0].write;
+    const notifyChars = channels.map((c) => c.notify);
+    this._mark(`canaux trouvés : ${channels.map((c) => c.label).join(' + ')}`);
 
     for (const ch of this.notifyChars ?? []) ch.removeEventListener('characteristicvaluechanged', this._onNotify);
     this.notifyChars = notifyChars;
     this._assemblers = new Map(notifyChars.map((ch) => [ch, new FrameAssembler((f) => this._onFrame(f))]));
     for (const ch of notifyChars) {
       ch.addEventListener('characteristicvaluechanged', this._onNotify);
+      // Bluefy has been reported to deliver notifications only through the on* handler.
+      try { ch.oncharacteristicvaluechanged = this._onNotify; } catch { /* read-only in some engines */ }
       await ch.startNotifications();
       if (toggleCccd) {
         // iOS keeps CCCD state between connections: toggle it to get a clean subscription.
@@ -285,10 +279,17 @@ export class Scooter extends EventTarget {
   // ---------------------------------------------------------------- transport
 
   _onNotify(event) {
-    const v = event.target.value;
+    const ch = event.target;
+    const v = ch.value;
+    if (!v) return;
     const chunk = new Uint8Array(v.buffer, v.byteOffset, v.byteLength).slice();
-    this.log('debug', `notif ${event.target.uuid?.slice(4, 8) ?? '?'} (${chunk.length} o)`);
-    (this._assemblers?.get(event.target) ?? this._assembler).push(chunk);
+    // Some browsers fire both the listener and the on* handler: ignore the duplicate delivery.
+    const now = performance.now();
+    const last = this._lastChunk?.get(ch);
+    if (last && now - last.at < 15 && bytesEqual(last.bytes, chunk)) return;
+    (this._lastChunk ??= new Map()).set(ch, { bytes: chunk, at: now });
+    this.log('debug', `notif ${ch.uuid?.slice(4, 8) ?? '?'} ${toHex(chunk)}`);
+    (this._assemblers?.get(ch) ?? this._assembler).push(chunk);
   }
 
   _onFrame(frame) {
@@ -374,94 +375,135 @@ export class Scooter extends EventTarget {
 
   // ---------------------------------------------------------------- handshake
 
-  async _handshake(variant) {
-    const crypto = new NbCrypto(variant.ecb);
-    this.crypto = crypto;
-    this.sync2 = variant.sync2;
+  /**
+   * Sends `plainFrame` (re-encrypted each time) every `intervalMs` until a response matches,
+   * like the official app does for SET_PWD / AUTH. `burst` copies are sent on the first round.
+   */
+  async _repeatUntil(plainFrame, match, { timeoutMs, intervalMs = RESEND_MS, burst = 1 }) {
+    this._rxQueue = [];
+    const deadline = Date.now() + timeoutMs;
+    let nextSend = 0;
+    for (;;) {
+      if (Date.now() >= deadline) throw new ScooterError('TIMEOUT', 'Pas de réponse de la trottinette.');
+      if (Date.now() >= nextSend) {
+        for (let i = 0; i < burst; i++) await this._write(await this.crypto.encrypt(plainFrame));
+        burst = 1;
+        nextSend = Date.now() + intervalMs;
+      }
+      let raw;
+      try {
+        raw = await this._nextFrame(Math.max(5, Math.min(nextSend, deadline) - Date.now()));
+      } catch (err) {
+        if (err.code === 'TIMEOUT') continue;
+        throw err;
+      }
+      const { plain, ok } = await this.crypto.decrypt(raw);
+      const frame = parseFrame(plain);
+      if (frame && match(frame)) {
+        if (!ok) this.log('debug', 'Réponse acceptée malgré un contrôle d\'intégrité invalide.');
+        return frame;
+      }
+      this.log('debug', `Trame ignorée : ${toHex(plain)}`);
+    }
+  }
+
+  /** PRE_COMM: tries each (board, channel) pair until the scooter answers with its challenge. */
+  async _preComm() {
+    const crypto = this.crypto;
+    const preferredBoard = this.btName.toUpperCase().startsWith('1CG') ? BLE_BOARD_NEW : BLE_BOARD_LEGACY;
+    const boards = [preferredBoard, preferredBoard === BLE_BOARD_NEW ? BLE_BOARD_LEGACY : BLE_BOARD_NEW];
+    const plan = [];
+    for (const board of boards) for (const channel of this.channels) plan.push({ board, channel });
+
+    // Put the combination that worked last time first.
+    const saved = storage.get(`zt3:route:${this.btName}`);
+    plan.sort((a, b) => Number(`${b.board}:${b.channel.label}` === saved) - Number(`${a.board}:${a.channel.label}` === saved));
+
+    for (const { board, channel } of plan) {
+      this.writeChar = channel.write;
+      crypto.resetSn();
+      this._mark(`PRE_COMM → carte 0x${board.toString(16)} via ${channel.label}`);
+      try {
+        const pre = await this._transact(
+          buildFrame(SYNC2, board, CMD.PRE_COMM, 0x00),
+          (f) => f.cmd === CMD.PRE_COMM && f.data.length >= 30,
+          2500,
+        );
+        storage.set(`zt3:route:${this.btName}`, `${board}:${channel.label}`);
+        return pre;
+      } catch (err) {
+        if (err.code !== 'TIMEOUT' && err.code !== 'ECHO') throw err;
+        this.log('info', `[${this._elapsed()}] pas de réponse (${err.code === 'ECHO' ? 'écho' : 'silence'})`);
+      }
+    }
+    throw new ScooterError('TIMEOUT', 'La trottinette ne répond pas à la demande d\'appairage.');
+  }
+
+  async _handshake() {
     const name = utf8(this.btName);
+    this.crypto = new NbCrypto(FW_DATA, { followPeer: true });
+    this.crypto.setKey(name, FW_DATA);
+    this.sync2 = SYNC2;
 
-    // Phase 1: PRE_COMM (non-SN mode)
-    this._mark(`PRE_COMM envoyé (${variant.id})`);
-    crypto.resetSn();
-    crypto.setKey(name, variant.key2);
-    const pre = await this._transact(
-      buildFrame(this.sync2, BOARD.BLE, CMD.PRE_COMM, 0x00),
-      (f) => f.cmd === CMD.PRE_COMM,
-      5000,
-    );
-    if (pre.data.length < 30) throw new ScooterError('PROTOCOL', `Réponse PRE_COMM trop courte (${pre.data.length} octets).`);
-
+    // Phase 1: PRE_COMM -> 16-byte challenge + 14-byte serial
+    const pre = await this._preComm();
+    this.peer = pre.source;
     const auth = pre.data.slice(0, 16);
     const sn = pre.data.slice(16, 30);
     this.serial = ascii(sn);
-    this._mark(`PRE_COMM reçu — n° de série ${this.serial}${pre.index ? ', déjà appairée à une autre appli' : ''}`);
-    crypto.setAuthParam(auth);
-    crypto.startSn();
+    this.crypto.setAuthParam(auth);
+    this._mark(`PRE_COMM reçu de la carte 0x${this.peer.toString(16)} — n° de série ${this.serial}`);
 
-    // Phase 3 directly if we already paired with this scooter
     const pwdKey = `zt3:pwd:${this.serial}`;
     const stored = storage.get(pwdKey);
     if (stored) {
-      this.log('info', 'Mot de passe de session connu, authentification…');
-      if (await this._auth(fromHex(stored), auth, sn)) return;
-      this.log('warn', 'Mot de passe enregistré refusé, nouvel appairage.');
-      storage.remove(pwdKey);
+      // Already paired with this site: try AUTH directly, no button press needed.
+      this.crypto.setKey(fromHex(stored), auth);
+      this._mark('AUTH avec l\'appairage enregistré');
+      try {
+        await this._repeatUntil(buildFrame(SYNC2, this.peer, CMD.AUTH, 0x00, sn),
+          (f) => f.cmd === CMD.AUTH && f.index === 1, { timeoutMs: 3000 });
+        this._mark('authentifié');
+        return;
+      } catch (err) {
+        if (err.code !== 'TIMEOUT') throw err;
+        storage.remove(pwdKey);
+        throw new ScooterError('AUTH_STALE', 'Appairage enregistré refusé, nouvel appairage au prochain essai.');
+      }
     }
 
-    // Phase 2: SET_PWD (may need a button press on the scooter)
-    const password = await this._setPassword(name, auth);
-
-    // Phase 3: AUTH
-    if (!(await this._auth(password, auth, sn))) {
-      throw new ScooterError('AUTH', 'Authentification refusée par la trottinette.');
-    }
-    storage.set(pwdKey, toHex(password, ''));
-  }
-
-  async _setPassword(name, auth) {
-    this._mark('SET_PWD envoyé (nouvel appairage)');
-    this.crypto.setKey(name, auth);
+    // Phase 2: SET_PWD, confirmed by a short press on the scooter's power button
     const password = randomBytes(16);
-    const frame = buildFrame(this.sync2, BOARD.BLE, CMD.SET_PWD, 0x00, password);
-    const isSetPwd = (f) => f.cmd === CMD.SET_PWD;
-
-    let resp = await this._transact(frame, isSetPwd, 5000);
-    if (resp.index === 1) return password;
-
-    this.log('info', 'La trottinette attend une confirmation physique.');
+    this.crypto.setKey(name, auth);
+    this._mark('SET_PWD envoyé — appuie sur le bouton Power');
     this._progress('Appuie sur Power…');
     this.dispatchEvent(new Event('pairing-request'));
     try {
-      const deadline = Date.now() + PAIRING_TIMEOUT_MS;
-      while (Date.now() < deadline) {
-        try {
-          resp = await this._awaitResponse(isSetPwd, 2000);
-        } catch (err) {
-          if (err.code !== 'TIMEOUT') throw err;
-          resp = await this._transact(frame, isSetPwd, 2000).catch((e) => {
-            if (e.code === 'TIMEOUT') return null;
-            throw e;
-          });
-        }
-        if (resp?.index === 1) return password;
-      }
+      await this._repeatUntil(buildFrame(SYNC2, this.peer, CMD.SET_PWD, 0x00, password),
+        (f) => f.cmd === CMD.SET_PWD && f.index === 1, { timeoutMs: PAIRING_TIMEOUT_MS, burst: 4 });
+    } catch (err) {
+      if (err.code === 'TIMEOUT') throw new ScooterError('PAIRING', 'Bouton Power non pressé à temps (60 s).');
+      throw err;
     } finally {
       this.dispatchEvent(new Event('pairing-done'));
     }
-    throw new ScooterError('PAIRING', 'Appairage non confirmé à temps sur la trottinette.');
+    this._mark('bouton Power détecté');
+
+    // Phase 3: AUTH with the new password
+    this.crypto.setKey(password, auth);
+    this._progress('Sécurisation…');
+    this._mark('AUTH envoyé');
+    try {
+      await this._repeatUntil(buildFrame(SYNC2, this.peer, CMD.AUTH, 0x00, sn),
+        (f) => f.cmd === CMD.AUTH && f.index === 1, { timeoutMs: 10_000 });
+    } catch (err) {
+      if (err.code === 'TIMEOUT') throw new ScooterError('AUTH', 'Authentification non confirmée par la trottinette.');
+      throw err;
+    }
+    storage.set(pwdKey, toHex(password, ''));
+    this._mark('authentifié');
   }
 
-  async _auth(password, auth, sn) {
-    this._mark('AUTH envoyé');
-    this.crypto.setKey(password, auth);
-    const resp = await this._transact(
-      buildFrame(this.sync2, BOARD.BLE, CMD.AUTH, 0x00, sn),
-      (f) => f.cmd === CMD.AUTH,
-      5000,
-    );
-    if (resp.index === 1) this.log('info', 'Authentifié.');
-    return resp.index === 1;
-  }
 
   // ---------------------------------------------------------------- registers
 
@@ -473,7 +515,8 @@ export class Scooter extends EventTarget {
   readRegister(board, reg, len = 2) {
     return this._exclusive(async () => {
       this._ensureConnected();
-      const frame = buildFrame(this.sync2, board, CMD.READ, reg, Uint8Array.of(len));
+      // The official app sends the length as a little-endian u16 (e.g. 02 00).
+      const frame = buildFrame(this.sync2, board, CMD.READ, reg, u16le(len));
       const match = (f) => f.cmd === CMD.READ_ACK && f.index === reg;
       for (let attempt = 0; ; attempt++) {
         try {

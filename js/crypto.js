@@ -145,10 +145,13 @@ function checksum16(bytes) {
  * change keys right after sending without racing in-flight operations.
  */
 export class NbCrypto {
-  constructor(ecbInput = null) {
+  constructor(ecbInput = null, { followPeer = false } = {}) {
     this.ecbInput = pad16(ecbInput);
     this.auth = new Uint8Array(16);
     this.counter = 0;
+    // Official Segway app behaviour on "x3" scooters (G3/GT3/ZT3): the message counter is shared,
+    // every received SN frame sets it, and the next sent frame uses received + 1.
+    this.followPeer = followPeer;
     this._keyPromise = deriveKey(new Uint8Array(0), null);
   }
 
@@ -202,8 +205,14 @@ export class NbCrypto {
     const header = frame.slice(0, 3);
     const body = frame.subarray(3, frame.length - 6);
     const tail = frame.subarray(frame.length - 6);
-    const counter = (tail[4] << 8) | tail[5];
+    const recv16 = (tail[4] << 8) | tail[5];
     const key = await keyPromise;
+
+    // Rebuild the full counter from the 16-bit wire value (handles wrap-around).
+    let base = this.counter;
+    if ((base & 0x8000) && !(recv16 & 0x8000)) base += 0x10000;
+    const counter = recv16 === 0 ? 0 : ((base & ~0xffff) | recv16) >>> 0;
+    if (counter > 0 && this.followPeer) this.counter = counter;
 
     if (counter > 0) {
       const nonce = buildNonce(counter, auth);

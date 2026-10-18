@@ -5,7 +5,7 @@
 
 export const BOARD = Object.freeze({
   MCU: 0x02,
-  BLE: 0x04, // handshake target
+  BLE: 0x04, // handshake target on "1CG…" scooters (0x21 on the others, see scooter.js)
   BMS2: 0x06,
   BMS1: 0x07,
   VCU: 0x16, // vehicle control unit: settings + telemetry
