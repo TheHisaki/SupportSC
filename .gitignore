@@ -1,0 +1,4 @@
+# Local test server (certificates + private keys, node_modules): never pushed.
+local/
+node_modules/
+*.key

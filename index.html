@@ -1,0 +1,115 @@
+<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#0f1115">
+  <title>ZT3 Control</title>
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <h1>ZT3 Control</h1>
+    <span id="status" class="pill pill-off" role="status" aria-live="polite">Déconnecté</span>
+  </header>
+
+  <main>
+    <section id="unsupported" class="card warn" hidden>
+      <h2>Bluetooth indisponible</h2>
+      <p>Ce navigateur ne gère pas le Web Bluetooth. Sur iPhone, ouvre ce site dans l'appli <strong>Bluefy</strong>. Sur Android ou PC, utilise Chrome.</p>
+    </section>
+
+    <section class="card" aria-labelledby="connect-title">
+      <h2 id="connect-title">Connexion</h2>
+      <ol class="steps">
+        <li>Ferme complètement l'appli Segway (balaye-la hors de l'écran) : une seule appli peut être connectée à la fois.</li>
+        <li>Allume la trottinette.</li>
+        <li>Appuie sur « Connecter », puis choisis ta trottinette dans la liste.</li>
+        <li>La première fois seulement, appuie brièvement sur le bouton Power de la trottinette quand le site te le demande.</li>
+      </ol>
+      <div class="row">
+        <button id="btn-connect" class="btn btn-primary" type="button">Connecter la trottinette</button>
+        <button id="btn-disconnect" class="btn" type="button" hidden>Déconnecter</button>
+      </div>
+      <details class="advanced">
+        <summary>Options avancées</summary>
+        <label class="inline"><input id="show-all" type="checkbox"> Afficher tous les appareils Bluetooth (si la trottinette n'apparaît pas)</label>
+        <label for="name-override">Nom Bluetooth (si la connexion échoue)</label>
+        <input id="name-override" type="text" autocomplete="off" autocapitalize="characters" spellcheck="false" placeholder="Numéro de série, ex. 03GGG2539C0023">
+        <p class="hint">Ce nom sert de clé de chiffrement. Laisse vide pour utiliser le nom détecté.</p>
+        <button id="btn-forget" class="btn btn-small" type="button">Oublier l'appairage enregistré</button>
+      </details>
+    </section>
+
+    <section id="dashboard" class="card" aria-labelledby="dash-title" hidden>
+      <div class="card-head">
+        <h2 id="dash-title">Trottinette</h2>
+        <button id="btn-refresh" class="btn btn-small" type="button">Actualiser</button>
+      </div>
+      <dl class="stats">
+        <div><dt>Batterie</dt><dd id="stat-battery">–</dd></div>
+        <div><dt>Compteur</dt><dd id="stat-mileage">–</dd></div>
+        <div><dt>Mode actuel</dt><dd id="stat-gear">–</dd></div>
+        <div><dt>N° de série</dt><dd id="stat-serial">–</dd></div>
+      </dl>
+      <h3>Vitesse max par mode</h3>
+      <dl class="stats stats-modes">
+        <div><dt>E</dt><dd id="speed-E">–</dd></div>
+        <div><dt>D</dt><dd id="speed-D">–</dd></div>
+        <div><dt>S</dt><dd id="speed-S">–</dd></div>
+      </dl>
+    </section>
+
+    <section class="card" aria-labelledby="shortcuts-title">
+      <h2 id="shortcuts-title">Raccourcis</h2>
+      <ul id="shortcut-list" class="shortcuts"></ul>
+
+      <form id="shortcut-form" class="shortcut-form">
+        <h3>Nouveau raccourci vitesse</h3>
+        <div class="row">
+          <div class="field">
+            <label for="sc-mode">Mode</label>
+            <select id="sc-mode">
+              <option value="E">E (Eco)</option>
+              <option value="D">D (Standard)</option>
+              <option value="S" selected>S (Sport)</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="sc-speed">Vitesse (km/h)</label>
+            <input id="sc-speed" type="number" inputmode="numeric" min="6" max="25" step="1" value="20" required>
+          </div>
+        </div>
+        <button class="btn" type="submit">Ajouter</button>
+      </form>
+    </section>
+
+    <section class="card" aria-labelledby="log-title">
+      <details>
+        <summary id="log-title">Journal technique</summary>
+        <label class="inline"><input id="log-debug" type="checkbox"> Afficher les trames (debug)</label>
+        <pre id="log" class="log" aria-live="off"></pre>
+        <div class="row">
+          <button id="btn-copy-log" class="btn btn-small" type="button">Copier le journal</button>
+          <button id="btn-clear-log" class="btn btn-small" type="button">Effacer</button>
+        </div>
+      </details>
+    </section>
+  </main>
+
+  <div id="pairing" class="overlay" role="alertdialog" aria-modal="true" aria-labelledby="pairing-title" hidden>
+    <div class="overlay-box">
+      <h2 id="pairing-title">Confirme sur la trottinette</h2>
+      <p>Appuie <strong>une fois, brièvement</strong> sur le bouton Power de la trottinette pour autoriser l'appairage. Un appui long l'éteindrait.</p>
+      <p class="hint">Tu as 60 secondes. Ce n'est demandé qu'au premier appairage.</p>
+      <div class="spinner" aria-hidden="true"></div>
+    </div>
+  </div>
+
+  <div id="toast" class="toast" role="status" aria-live="assertive" hidden></div>
+
+  <footer class="footer">Version <span id="app-version"></span></footer>
+
+  <script type="module" src="js/app.js"></script>
+</body>
+</html>
