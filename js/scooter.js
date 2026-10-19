@@ -287,7 +287,20 @@ export class Scooter extends EventTarget {
       this.log('warn', 'Mot de passe enregistré refusé, nouvel appairage.');
     }
 
+    // PRE_COMM index != 0 means the vehicle already has a stored pairing
+    // password. SET_PWD cannot replace that password merely by pressing Power;
+    // the owner must unbind it in the official Segway/Ninebot app first, or
+    // provide the password recovered from the owner's app backup.
+    if (pre.index !== 0) {
+      throw new ScooterError('BOUND',
+        "Cette ZT3 est déjà appairée (PRE_COMM index 1). Ouvre l’application Segway/Ninebot " +
+        "avec le compte lié, sélectionne la trottinette → menu ☰ → Dissocier/Unbind, " +
+        "confirme le code e-mail, ferme complètement l’application, puis réessaie. " +
+        "Un appui sur Power ne peut pas remplacer cet ancien mot de passe.");
+    }
+
     // X3/ZT3 firmware derives the password from auth + current time using
+    // the Java-compatible generator used by the public reference clients.
     // the Java-compatible generator used by the public reference clients.
     const password = await generatePairingPassword(this._auth);
     this.crypto.setKey(utf8(this.btName), this._auth);
