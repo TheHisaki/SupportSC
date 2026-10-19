@@ -1,11 +1,10 @@
-// Register explorer. The ZT3 firmware exposes several speed/gear registers and the
-// documentation does not say which one actually limits the vehicle, so the only reliable
-// way to find it is to read them all, change the value in the Segway app, read them again
-// and diff the two snapshots.
+// Register explorer. The ZT3 packs two gear speeds per register (one per byte), so the
+// diff between two snapshots is reported byte by byte: that is what pinned down 0x48 as
+// the register driving the Sport limit.
 
-import { toHex } from './crypto.js';
+import { fromHex, toHex } from './crypto.js';
 import { readU16 } from './protocol.js';
-import { BOARD, BOARD_NAMES, GEAR_FAMILY, REG } from './registers.js';
+import { BOARD, BOARD_NAMES, GEAR_PAIR, REG } from './registers.js';
 
 const hex2 = (n) => n.toString(16).toUpperCase().padStart(2, '0');
 
@@ -28,11 +27,9 @@ export const SPEED_PROBES = Object.freeze([
   { board: BOARD.VCU, reg: REG.S_GEAR_SPEED, len: 2, name: 'rSGear' },
   { board: BOARD.VCU, reg: REG.E_GEAR_SPEED, len: 2, name: 'rEGear' },
   { board: BOARD.VCU, reg: REG.D_GEAR_SPEED, len: 2, name: 'rDGear' },
-  // Gear bank documented for the wider Ninebot family; may be absent on the ZT3.
+  // Gear bank documented for the wider Ninebot family; answers all zeroes on the ZT3.
   { board: BOARD.MCU, reg: 0x09, len: 2, name: 'rMCUMaxSpeed' },
-  { board: BOARD.MCU, reg: 0x22, len: 32, name: 'rGearData1' },
   { board: BOARD.MCU, reg: 0x31, len: 2, name: 'GearTopSpeed' },
-  { board: BOARD.MCU, reg: 0x3a, len: 32, name: 'rGearData2' },
   { board: BOARD.MCU, reg: 0x49, len: 2, name: 'GearTopSpeed2' },
   { board: BOARD.MCU, reg: 0x52, len: 2, name: 'rSpeedIntensity' },
   { board: BOARD.MCU, reg: 0x53, len: 2, name: 'rSpeedSafeLock' },
@@ -84,34 +81,91 @@ export function sweepBoard(scooter, board, { from = 0x00, to = 0xff, len = 2, on
   return readProbes(scooter, probes, { onProgress });
 }
 
-/** A max-speed setting is plausible as whole km/h in this window (walk mode excluded). */
-const isPlausibleKmh = (v) => Number.isInteger(v) && v >= 5 && v <= 100;
+// ---------------------------------------------------------------- snapshot storage
 
-/** Reads a gear family (current value + the min/max the firmware accepts). */
-export async function readGearFamily(scooter, familyKey) {
-  const family = GEAR_FAMILY[familyKey];
-  if (!family) throw new Error(`Famille inconnue : ${familyKey}`);
-  const read = async (reg) => {
-    const bytes = await scooter.probeRegister(BOARD.VCU, reg, 2);
-    return bytes && bytes.length >= 2 ? readU16(bytes) : null;
+// Snapshots survive a page reload, because switching to the Segway app and back reloads
+// the page in Bluefy and used to lose snapshot A.
+
+const slotKey = (slot) => `zt3:diag:${slot}`;
+
+export function saveSnapshot(slot, snapshot) {
+  const payload = {
+    at: snapshot.at,
+    rows: snapshot.rows.map(({ board, reg, len, name, bytes, error }) => ({
+      board, reg, len, name, error: error ?? null, hex: bytes ? toHex(bytes, '') : null,
+    })),
   };
-  const [value, min, max] = [await read(family.reg), await read(family.minReg), await read(family.maxReg)];
-  const usable = isPlausibleKmh(value) && isPlausibleKmh(min) && isPlausibleKmh(max)
-    && min < max && value >= min && value <= max;
-  return { ...family, value, min, max, usable };
+  try {
+    localStorage.setItem(slotKey(slot), JSON.stringify(payload));
+  } catch { /* private mode or quota */ }
 }
 
-export async function readAllGearFamilies(scooter) {
+export function loadSnapshot(slot) {
+  let payload = null;
+  try {
+    payload = JSON.parse(localStorage.getItem(slotKey(slot)) ?? 'null');
+  } catch {
+    return null;
+  }
+  if (!payload?.rows?.length) return null;
+  return {
+    at: payload.at,
+    rows: payload.rows.map((r) => {
+      const bytes = r.hex ? fromHex(r.hex) : null;
+      return { ...r, bytes, value: bytes && bytes.length >= 2 ? readU16(bytes) : null };
+    }),
+  };
+}
+
+export function clearSnapshots() {
+  for (const slot of ['A', 'B']) {
+    try { localStorage.removeItem(slotKey(slot)); } catch { /* ignore */ }
+  }
+}
+
+// ---------------------------------------------------------------- gear pairs
+
+/** A gear speed is plausible as whole km/h in this window (walk mode excluded). */
+const isPlausibleKmh = (v) => Number.isInteger(v) && v >= 1 && v <= 100;
+
+/**
+ * Reads a gear pair: the two packed speeds plus the two packed min/max bounds.
+ * `usable` means the three registers answered and form a coherent km/h range.
+ */
+export async function readGearPair(scooter, pairKey) {
+  const pair = GEAR_PAIR[pairKey];
+  if (!pair) throw new Error(`Paire inconnue : ${pairKey}`);
+  const read = async (reg) => {
+    const bytes = await scooter.probeRegister(BOARD.VCU, reg, 2);
+    return bytes && bytes.length >= 2 ? [bytes[0], bytes[1]] : null;
+  };
+  const value = await read(pair.reg);
+  const min = await read(pair.minReg);
+  const max = await read(pair.maxReg);
+  const coherent = (i) => isPlausibleKmh(min?.[i]) && isPlausibleKmh(max?.[i])
+    && min[i] < max[i] && value?.[i] >= min[i] && value[i] <= max[i];
+  return {
+    ...pair,
+    value,
+    min,
+    max,
+    usable: [0, 1].map(coherent),
+  };
+}
+
+export async function readAllGearPairs(scooter) {
   const out = {};
-  for (const key of Object.keys(GEAR_FAMILY)) {
+  for (const key of Object.keys(GEAR_PAIR)) {
     try {
-      out[key] = await readGearFamily(scooter, key);
+      out[key] = await readGearPair(scooter, key);
     } catch (err) {
-      out[key] = { ...GEAR_FAMILY[key], error: err.message };
+      out[key] = { ...GEAR_PAIR[key], error: err.message };
     }
   }
   return out;
 }
+
+// ---------------------------------------------------------------- formatting
 
 function needleHits(row, needle) {
   if (!needle || !row.bytes?.length) return [];
@@ -137,7 +191,10 @@ export function formatSnapshot(snapshot, { needle = null, skipSilent = false } =
       if (!skipSilent) lines.push(`${label} –`);
       continue;
     }
-    let line = `${label} ${String(row.value ?? '?').padStart(6)}  [${toHex(row.bytes)}]`;
+    // Two-byte registers are shown as "o0 / o1" because the gear registers pack one
+    // speed per byte; the u16 value alone is meaningless there.
+    const packed = row.bytes.length === 2 ? `  ${row.bytes[0]} / ${row.bytes[1]}` : '';
+    let line = `${label} [${toHex(row.bytes)}]${packed}`;
     const hits = needleHits(row, needle);
     if (hits.length) line += `  <<< ${hits.join(', ')}`;
     lines.push(line);
@@ -145,19 +202,25 @@ export function formatSnapshot(snapshot, { needle = null, skipSilent = false } =
   return lines.join('\n');
 }
 
-/** Lists the registers whose content differs between two snapshots. */
+/** Lists what changed between two snapshots, byte by byte for packed registers. */
 export function diffSnapshots(before, after) {
   const index = new Map(before.rows.map((r) => [probeKey(r), r]));
   const lines = [];
   for (const row of after.rows) {
     const old = index.get(probeKey(row));
     if (!old) continue;
-    const a = old.bytes?.length ? toHex(old.bytes) : '–';
-    const b = row.bytes?.length ? toHex(row.bytes) : '–';
+    const a = old.bytes?.length ? toHex(old.bytes) : null;
+    const b = row.bytes?.length ? toHex(row.bytes) : null;
     if (a === b) continue;
-    const va = old.value ?? '?';
-    const vb = row.value ?? '?';
-    lines.push(`${probeLabel(row).padEnd(26)} ${String(va).padStart(6)} -> ${String(vb).padStart(6)}  [${a}] -> [${b}]`);
+    let line = `${probeLabel(row).padEnd(26)} [${a ?? '–'}] -> [${b ?? '–'}]`;
+    if (old.bytes?.length === row.bytes?.length) {
+      const changed = [];
+      for (let i = 0; i < row.bytes.length; i++) {
+        if (old.bytes[i] !== row.bytes[i]) changed.push(`octet ${i} : ${old.bytes[i]} -> ${row.bytes[i]}`);
+      }
+      if (changed.length) line += `  (${changed.join(', ')})`;
+    }
+    lines.push(line);
   }
   return lines;
 }

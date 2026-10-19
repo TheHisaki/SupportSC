@@ -5,14 +5,16 @@ import {
   isValidSpeed, loadShortcuts, readAllModeSpeeds, runShortcut, saveCustomShortcuts, shortcutLabel,
 } from './shortcuts.js';
 import {
-  SPEED_PROBES, diffSnapshots, formatSnapshot, readAllGearFamilies, readProbes, sweepBoard,
+  SPEED_PROBES, clearSnapshots, diffSnapshots, formatSnapshot, loadSnapshot, readProbes,
+  saveSnapshot, sweepBoard,
 } from './diagnostic.js';
 
 // Bumped on every deploy so you can check the phone shows the latest version.
-const APP_VERSION = '1.13.0';
+const APP_VERSION = '1.14.0';
 
 const $ = (id) => document.getElementById(id);
 const fmt = (v) => (v === null || v === undefined ? '–' : v);
+const pairText = (bytes) => (bytes ? `${bytes[0]} / ${bytes[1]}` : '–');
 
 const ui = {
   status: $('status'),
@@ -35,9 +37,11 @@ const ui = {
   scMode: $('sc-mode'),
   scSpeed: $('sc-speed'),
   diagNeedle: $('diag-needle'),
+  diagState: $('diag-state'),
   diagA: $('btn-diag-a'),
   diagB: $('btn-diag-b'),
   diagDiff: $('btn-diag-diff'),
+  diagReset: $('btn-diag-reset'),
   diagSweep: $('btn-diag-sweep'),
   diagCopy: $('btn-diag-copy'),
   diagOut: $('diag-out'),
@@ -152,27 +156,26 @@ async function refreshDashboard() {
   ui.gear.textContent = gear === null ? '?' : `brut ${gear}`;
 
   const speeds = await readAllModeSpeeds(scooter);
+  const pairs = {};
   for (const [key, s] of Object.entries(speeds)) {
     const el = $(`speed-${key}`);
-    if (s.error) el.textContent = '?';
-    else if (s.kmh !== null) el.textContent = `${s.kmh} km/h`;
-    else el.textContent = `brut ${s.raw}`;
-    log('info', s.error ? `Mode ${key} : ${s.error}` : `Mode ${key} : brut ${s.raw}${s.scale ? ` → ${s.kmh} km/h` : ''}`);
-  }
-
-  const families = await readAllGearFamilies(scooter);
-  for (const [key, f] of Object.entries(families)) {
-    const el = $(`gear-${key}`);
-    if (!el) continue;
-    if (f.error) {
+    if (s.error) {
       el.textContent = '?';
-      log('warn', `${f.label} : ${f.error}`);
+      log('warn', `Mode ${key} : ${s.error}`);
       continue;
     }
-    const range = `${fmt(f.min)}–${fmt(f.max)}`;
-    el.textContent = f.value === null ? '–' : `${f.value} (${range})`;
-    log('info', `${f.label} 0x${f.reg.toString(16)} = ${fmt(f.value)} (min ${fmt(f.min)}, max ${fmt(f.max)})`
-      + (f.usable ? ' — exploitable comme km/h' : ' — pas des km/h, non utilisé'));
+    pairs[s.pair.key] = s.pair;
+    el.textContent = s.kmh === null ? '–' : `${s.kmh} km/h`;
+    log('info', `Mode ${key} = ${fmt(s.kmh)} km/h (0x${s.pair.reg.toString(16)} octet ${s.byte}, `
+      + `plage ${fmt(s.min)}–${fmt(s.max)})`);
+  }
+
+  for (const [key, p] of Object.entries(pairs)) {
+    const el = $(`gear-${key}`);
+    if (!el) continue;
+    el.textContent = pairText(p.value);
+    log('info', `${p.label} 0x${p.reg.toString(16)} = ${pairText(p.value)}`
+      + ` | min ${pairText(p.min)} | max ${pairText(p.max)}`);
   }
 }
 
@@ -271,10 +274,22 @@ ui.shortcutForm.addEventListener('submit', (event) => {
 
 // ------------------------------------------------------------------ diagnostic
 
-const snapshots = { A: null, B: null };
+// Snapshots are kept in localStorage: going to the Segway app and back reloads the page
+// in Bluefy, which used to wipe snapshot A before it could be compared.
+const snapshots = { A: loadSnapshot('A'), B: loadSnapshot('B') };
 
 function setDiag(text) {
   ui.diagOut.textContent = text;
+}
+
+function snapshotSummary() {
+  return ['A', 'B']
+    .map((slot) => `${slot} : ${snapshots[slot] ? new Date(snapshots[slot].at).toLocaleTimeString('fr-FR') : '–'}`)
+    .join('   ');
+}
+
+function showSnapshotSummary() {
+  ui.diagState.textContent = `Instantanés en mémoire — ${snapshotSummary()}`;
 }
 
 /** Also pushed to the journal line by line, so "Copier le journal" carries the dump. */
@@ -296,6 +311,8 @@ async function takeSnapshot(slot) {
     onProgress: (done, total) => setStatus('busy', `Lecture ${done}/${total}`),
   });
   snapshots[slot] = snap;
+  saveSnapshot(slot, snap);
+  showSnapshotSummary();
   const needle = diagNeedle();
   reportDiag(
     `Instantané ${slot} — ${new Date(snap.at).toLocaleTimeString('fr-FR')}`
@@ -307,9 +324,18 @@ async function takeSnapshot(slot) {
 ui.diagA.addEventListener('click', () => withBusy(ui.diagA, () => takeSnapshot('A')));
 ui.diagB.addEventListener('click', () => withBusy(ui.diagB, () => takeSnapshot('B')));
 
+ui.diagReset.addEventListener('click', () => {
+  snapshots.A = null;
+  snapshots.B = null;
+  clearSnapshots();
+  showSnapshotSummary();
+  setDiag('');
+  toast('Instantanés effacés');
+});
+
 ui.diagDiff.addEventListener('click', () => {
   if (!snapshots.A || !snapshots.B) {
-    toast('Il faut les deux instantanés A et B', 'error');
+    toast(`Instantané manquant — ${snapshotSummary()}`, 'error');
     return;
   }
   const lines = diffSnapshots(snapshots.A, snapshots.B);
@@ -402,5 +428,6 @@ function showLastNameHint() {
 
 $('app-version').textContent = APP_VERSION;
 showLastNameHint();
+showSnapshotSummary();
 renderShortcuts();
 log('info', `Prêt (version ${APP_VERSION}).`);

@@ -29,10 +29,13 @@ const NB_AUTH_NOTIFY = '6e400006-0000-0000-006e-696e65626f74';
 const SYNC2 = 0xa5;
 const BOARD_AUTH = 0x04; // x3 auth target: the only board that answered PRE_COMM on a real ZT3
 const BOARD_BLE = 0x21;
-const SET_PWD_RESEND_MS = { sn: 2000, legacy: 500 };
-const SET_PWD_SILENT_MS = 6500; // no SET_PWD answer at all after ~3 sends -> wrong encoding
-const AUTH_RESEND_MS = 2000;
-const AUTH_TRIES = 3;
+const SET_PWD_RESEND_MS = { sn: 1000, legacy: 400 };
+const SET_PWD_SILENT_MS = 6500; // no SET_PWD answer at all after several sends -> wrong encoding
+const AUTH_RESEND_MS = 800; // a real ZT3 ignored the first two AUTH frames sent after SET_PWD
+const AUTH_WINDOW_MS = 6000;
+// Opening the Segway app overwrites the key stored in the vehicle, so a stored key that no
+// longer works must be dropped fast instead of being retried on every board and counter.
+const STORED_PWD_WINDOW_MS = 1800;
 const MAX_RECONNECTS = 3; // only when the scooter drops the link or stays silent (1 s, 2 s, 3 s backoff)
 const otherVariant = (v) => (v === 'sn' ? 'legacy' : 'sn');
 
@@ -188,7 +191,9 @@ export class Scooter extends EventTarget {
           reconnects++;
           // The scooter said "waiting for Power" with this encoding: it is the right one, keep it.
           // Otherwise (silence, immediate "OK" then drop on AUTH) try the other encoding.
-          if (!this._sawWaiting && err.code !== 'ECHO') {
+          // A failure before SET_PWD (stale stored key refused) says nothing about the
+          // encoding: switching variants there used to throw away a known-good setting.
+          if (this._triedSetPwd && !this._sawWaiting && err.code !== 'ECHO') {
             variant = otherVariant(variant);
             this.log('info', `Essai suivant avec l'encodage SET_PWD « ${variant} ».`);
           }
@@ -284,16 +289,23 @@ export class Scooter extends EventTarget {
    */
   async _authenticate(pre, variant, ctx) {
     this._sawWaiting = false;
+    this._triedSetPwd = false;
     if (variant === 'sn') this.crypto.startSn();
 
     const stored = storage.get(`zt3:pwd:${this.serial}`);
     if (stored && pre.index !== 0) {
       if (this.crypto.counter === 0) this.crypto.startSn();
       this.crypto.setKey(fromHex(stored), this._auth);
-      if (await this._sendAuth('AUTH avec le mot de passe enregistré (sans bouton)',
-        { targets: [BOARD_AUTH, BOARD_BLE], counters: [2, 3] })) return;
+      if (await this._sendAuth('AUTH avec la clé enregistrée (sans bouton)', {
+        targets: [this.pairBoard],
+        counters: [2, 3],
+        windowMs: STORED_PWD_WINDOW_MS,
+        intervalMs: 600,
+        stopOnRefusal: true,
+      })) return;
       storage.remove(`zt3:pwd:${this.serial}`);
-      this.log('warn', 'Mot de passe enregistré refusé, nouvel appairage.');
+      this.log('warn', "Clé enregistrée refusée : l'appli Segway l'a remplacée dans la trottinette. "
+        + 'Un nouvel appui sur Power est nécessaire.');
     }
 
     // X3/ZT3 legacy pairing uses a random app key for SET_PWD. This is the
@@ -305,6 +317,7 @@ export class Scooter extends EventTarget {
     this.crypto.setKey(utf8(this.btName), this._auth);
     ctx.deadline ??= Date.now() + PAIRING_TIMEOUT_MS;
     ctx.prompt();
+    this._triedSetPwd = true;
     this._mark(`SET_PWD (encodage ${variant}) — appuie sur Power`);
     const frame = buildFrame(SYNC2, BOARD_AUTH, CMD.SET_PWD, 0x00, password);
     let answered = false;
@@ -340,6 +353,7 @@ export class Scooter extends EventTarget {
       }
     }
     this._mark(this._sawWaiting ? 'SET_PWD accepté (Power confirmé)' : 'SET_PWD accepté tout de suite');
+    await sleep(250); // let the firmware commit the new key before the first AUTH frame
     // A few older ZT3 firmwares accept SET_PWD in non-SN mode but switch
     // their response/auth channel back to SN immediately afterwards.
     if (variant === 'legacy' && this.crypto.counter === 0) this.crypto.startSn();
@@ -355,7 +369,13 @@ export class Scooter extends EventTarget {
   }
 
   /** Sends AUTH (serial number) with the current key. Returns true if accepted. */
-  async _sendAuth(label, { targets = [BOARD_AUTH], counters = [null] } = {}) {
+  async _sendAuth(label, {
+    targets = [BOARD_AUTH],
+    counters = [null],
+    windowMs = AUTH_WINDOW_MS,
+    intervalMs = AUTH_RESEND_MS,
+    stopOnRefusal = false,
+  } = {}) {
     for (const counter of counters) {
       for (const target of targets) {
         if (counter !== null) this.crypto.setNextCounter(counter);
@@ -365,7 +385,7 @@ export class Scooter extends EventTarget {
         try {
           res = await this._repeatUntil(buildFrame(SYNC2, target, CMD.AUTH, 0x00, this._sn),
             (f) => f.cmd === CMD.AUTH || f.cmd === CMD.READ_ACK,
-            { timeoutMs: AUTH_RESEND_MS * AUTH_TRIES, intervalMs: AUTH_RESEND_MS });
+            { timeoutMs: windowMs, intervalMs });
         } catch (err) {
           if (err.code !== 'TIMEOUT') throw err;
           this.log('debug', `[${this._elapsed()}] AUTH sans réponse (${where}).`);
@@ -373,6 +393,8 @@ export class Scooter extends EventTarget {
         }
         if (res.index !== 1) {
           this.log('warn', `[${this._elapsed()}] AUTH : réponse ${res.index} (${where})`);
+          // An explicit refusal means the key is wrong, not the counter: stop guessing.
+          if (stopOnRefusal) return false;
           continue;
         }
         this._mark('authentifié');

@@ -49,20 +49,28 @@ export const REG = Object.freeze({
 });
 
 /**
- * Writable gear-speed "families". The ZT3 firmware exposes one speed register per gear
- * pair (E/D and S/R) together with the min/max it accepts, so a write can be clamped to
- * what the vehicle itself allows instead of being guessed.
+ * Gear-speed pairs. Each register packs TWO gear speeds as whole km/h, one per byte, and
+ * comes with min/max registers packed the same way. Confirmed on a real ZT3 Pro by changing
+ * the Sport limit in the Segway app and diffing the registers:
+ *   0x48 rGearSR  [28 14] -> [28 19]  (Segway app 20 km/h -> 25 km/h, high byte follows)
+ *   0x46 rGearSRMax  [28 28]          (both bytes capped at 40 km/h)
+ *   0x47 rGearED  [0F 19] = 15 / 25, equal to 0x45 rGearEDMax: E and D sit at their cap.
  */
-export const GEAR_FAMILY = Object.freeze({
+export const GEAR_PAIR = Object.freeze({
   ED: { key: 'ED', label: 'Gear E/D', reg: REG.GEAR_ED, minReg: REG.GEAR_ED_MIN, maxReg: REG.GEAR_ED_MAX },
   SR: { key: 'SR', label: 'Gear S/R', reg: REG.GEAR_SR, minReg: REG.GEAR_SR_MIN, maxReg: REG.GEAR_SR_MAX },
 });
 
-// Riding modes whose max speed can be set over BLE.
+/**
+ * Riding modes whose max speed can be set over BLE.
+ * `byte` is the index inside the pair register. Byte 1 of 0x48 is proven (see above);
+ * the E/D split is deduced from the caps (byte 0 maxes at 15, byte 1 at 25 km/h).
+ * `mirrorReg` is the plain-km/h copy the Segway app also writes, when there is one.
+ */
 export const SPEED_MODES = Object.freeze({
-  E: { key: 'E', label: 'Mode E (Eco)', reg: REG.E_GEAR_SPEED, family: 'ED' },
-  D: { key: 'D', label: 'Mode D (Standard)', reg: REG.D_GEAR_SPEED, family: 'ED' },
-  S: { key: 'S', label: 'Mode S (Sport)', reg: REG.S_GEAR_SPEED, family: 'SR' },
+  E: { key: 'E', label: 'Mode E (Eco)', pair: 'ED', byte: 0, mirrorReg: null, proven: false },
+  D: { key: 'D', label: 'Mode D (Standard)', pair: 'ED', byte: 1, mirrorReg: null, proven: false },
+  S: { key: 'S', label: 'Mode S (Sport)', pair: 'SR', byte: 1, mirrorReg: REG.S_GEAR_SPEED, proven: true },
 });
 
 // Legal limit for e-scooters on public roads in France / EU (and the EU firmware cap).
