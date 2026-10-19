@@ -61,8 +61,9 @@ main {
 .row { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-top: 12px; }
 .row-end { justify-content: flex-end; }
 .row-add { flex-wrap: nowrap; }
-.row-add select { flex: 0 0 72px; }
-.row-add input { flex: 1 1 60px; min-width: 0; }
+.row-add > * { min-width: 0; }
+.row-add .narrow { flex: 0 0 78px; }
+.row-add .grow { flex: 1 1 60px; }
 .row-add .btn { flex: 0 0 auto; }
 
 /* ------------------------------------------------------------------ buttons */

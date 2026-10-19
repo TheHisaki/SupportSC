@@ -1,5 +1,7 @@
 import { Scooter } from './scooter.js';
-import { BOARD, BOARD_NAMES, REG, MAX_SPEED_KMH, MIN_SPEED_KMH } from './registers.js';
+import {
+  BOARD, BOARD_NAMES, REG, LEGAL_SPEED_KMH, MAX_SPEED_KMH, MIN_SPEED_KMH,
+} from './registers.js';
 import { readU32 } from './protocol.js';
 import {
   isValidSpeed, loadShortcuts, readAllModeSpeeds, runShortcut, saveCustomShortcuts,
@@ -11,7 +13,7 @@ import {
 } from './diagnostic.js';
 
 // Bumped on every deploy so you can check the phone shows the latest version.
-const APP_VERSION = '1.16.0';
+const APP_VERSION = '1.17.0';
 
 const $ = (id) => document.getElementById(id);
 const fmt = (v) => (v === null || v === undefined ? '–' : v);
@@ -62,6 +64,18 @@ const ui = {
   debug: $('debug'),
   debugToggle: $('btn-debug'),
 };
+
+// ------------------------------------------------------------------ iOS shake to undo
+
+// "Shake to Undo" is an iOS system feature that no web page can switch off. Its dialog only
+// shows up when WebKit is holding a text-editing undo stack, which is why the speed fields
+// are pickers rather than text inputs. This guard neutralises an undo that gets through
+// anyway, so a shake can never silently change a value in the debug fields.
+document.addEventListener('beforeinput', (event) => {
+  if (event.inputType === 'historyUndo' || event.inputType === 'historyRedo') {
+    event.preventDefault();
+  }
+}, { capture: true });
 
 // ------------------------------------------------------------------ log
 
@@ -440,8 +454,28 @@ ui.copyLog.addEventListener('click', async () => {
 
 // ------------------------------------------------------------------ init
 
-ui.scSpeed.min = String(MIN_SPEED_KMH);
-ui.scSpeed.max = String(MAX_SPEED_KMH);
+/** Fills a <select> with whole numbers. Pickers avoid the keyboard, and the keyboard is
+ *  what builds the iOS undo stack behind the "Undo Typing" shake dialog. */
+function fillNumberPicker(select, { min, max, selected = null, blankLabel = null }) {
+  const options = document.createDocumentFragment();
+  if (blankLabel !== null) {
+    const blank = document.createElement('option');
+    blank.value = '';
+    blank.textContent = blankLabel;
+    options.appendChild(blank);
+  }
+  for (let value = min; value <= max; value++) {
+    const option = document.createElement('option');
+    option.value = String(value);
+    option.textContent = String(value);
+    option.selected = value === selected;
+    options.appendChild(option);
+  }
+  select.replaceChildren(options);
+}
+
+fillNumberPicker(ui.scSpeed, { min: MIN_SPEED_KMH, max: MAX_SPEED_KMH, selected: LEGAL_SPEED_KMH });
+fillNumberPicker(ui.diagNeedle, { min: 1, max: 100, blankLabel: '—' });
 
 if (!window.isSecureContext) {
   ui.unsupported.querySelector('p').textContent =
