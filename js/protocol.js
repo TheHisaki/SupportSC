@@ -31,12 +31,20 @@ export function parseFrame(plain) {
   if (plain.length < 7) return null;
   if (plain[0] !== SYNC1 || !VALID_SYNC2.includes(plain[1])) return null;
   if (plain[4] !== BT_ID) return null;
+
   const len = plain[2];
+  // X3 firmware uses LEN=data length (7+LEN bytes). Keep support for the
+  // older format where LEN includes source/target/cmd/index (3+LEN bytes).
+  const isNewFormat = plain.length === 7 + len;
+  const isOldFormat = len >= 4 && plain.length === 3 + len;
+  if (!isNewFormat && !isOldFormat) return null;
+
+  const dataLength = isNewFormat ? len : len - 4;
   return {
     source: plain[3],
     cmd: plain[5],
     index: plain[6],
-    data: plain.slice(7, 7 + len),
+    data: plain.slice(7, 7 + dataLength),
   };
 }
 

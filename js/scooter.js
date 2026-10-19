@@ -1,7 +1,7 @@
 // Web Bluetooth connection + Ninebot Encryption2 handshake for the Segway ZT3 Pro.
 // Works in Bluefy (iOS) and Chrome (Android / desktop). Requires HTTPS.
 
-import { NbCrypto, FW_DATA, bytesEqual, fromHex, randomBytes, toHex } from './crypto.js';
+import { NbCrypto, FW_DATA, bytesEqual, fromHex, generatePairingPassword, toHex } from './crypto.js';
 import { CMD, FrameAssembler, buildFrame, parseFrame, readU16, u16le } from './protocol.js';
 
 const NB_SERVICE = '6e400001-0000-0000-006e-696e65626f74';
@@ -12,6 +12,7 @@ const NORDIC_WRITE = '6e400002-b5a3-f393-e0a9-e50e24dcca9e';
 const NORDIC_NOTIFY = '6e400003-b5a3-f393-e0a9-e50e24dcca9e';
 
 const NB_AUTH_WRITE = '6e400005-0000-0000-006e-696e65626f74';
+const NB_AUTH_NOTIFY = '6e400006-0000-0000-006e-696e65626f74';
 
 // Pairing flow of the iOS GT3 Pro companion app, verified on a real x3 scooter with packet captures
 // (https://github.com/djensenius/gt3pro, ScooterConnectionManager.swift / NinebotAuth.swift),
@@ -286,16 +287,17 @@ export class Scooter extends EventTarget {
       this.log('warn', 'Mot de passe enregistré refusé, nouvel appairage.');
     }
 
-    // New password for this connection, kept unchanged while waiting for the button.
-    const password = randomBytes(16);
+    // X3/ZT3 firmware derives the password from auth + current time using
+    // the Java-compatible generator used by the public reference clients.
+    const password = await generatePairingPassword(this._auth);
     this.crypto.setKey(utf8(this.btName), this._auth);
     ctx.deadline ??= Date.now() + PAIRING_TIMEOUT_MS;
     ctx.prompt();
     this._mark(`SET_PWD (encodage ${variant}) — appuie sur Power`);
-    const frame = buildFrame(SYNC2, this.peer, CMD.SET_PWD, 0x00, password);
+    const frame = buildFrame(SYNC2, BOARD_AUTH, CMD.SET_PWD, 0x00, password);
     let answered = false;
     const match = (f) => {
-      if (f.cmd !== CMD.SET_PWD) return false;
+      if (f.cmd !== CMD.SET_PWD && f.cmd !== CMD.READ_ACK) return false;
       answered = true;
       if (f.index === 1) return true;
       if (!this._sawWaiting) {
@@ -319,6 +321,9 @@ export class Scooter extends EventTarget {
       }
     }
     this._mark(this._sawWaiting ? 'SET_PWD accepté (Power confirmé)' : 'SET_PWD accepté tout de suite');
+    // A few older ZT3 firmwares accept SET_PWD in non-SN mode but switch
+    // their response/auth channel back to SN immediately afterwards.
+    if (variant === 'legacy' && this.crypto.counter === 0) this.crypto.startSn();
 
     this.crypto.setKey(password, this._auth);
     if (!(await this._sendAuth('AUTH'))) {
@@ -332,8 +337,8 @@ export class Scooter extends EventTarget {
     this._mark(label);
     let res;
     try {
-      res = await this._repeatUntil(buildFrame(SYNC2, this.peer, CMD.AUTH, 0x00, this._sn),
-        (f) => f.cmd === CMD.AUTH, { timeoutMs: AUTH_RESEND_MS * AUTH_TRIES, intervalMs: AUTH_RESEND_MS });
+      res = await this._repeatUntil(buildFrame(SYNC2, BOARD_AUTH, CMD.AUTH, 0x00, this._sn),
+        (f) => f.cmd === CMD.AUTH || f.cmd === CMD.READ_ACK, { timeoutMs: AUTH_RESEND_MS * AUTH_TRIES, intervalMs: AUTH_RESEND_MS });
     } catch (err) {
       if (err.code !== 'TIMEOUT') throw err;
       return false;
@@ -390,17 +395,20 @@ export class Scooter extends EventTarget {
     ]) {
       try {
         const svc = await server.getPrimaryService(svcUuid);
-        channels.push({
-          label,
-          write: await svc.getCharacteristic(writeUuid),
-          notify: await svc.getCharacteristic(notifyUuid),
-        });
+        const write = await svc.getCharacteristic(writeUuid);
+        const notify = await svc.getCharacteristic(notifyUuid);
+        let authNotify = null;
         if (svcUuid === NB_SERVICE) {
           this.authWriteChar = await svc.getCharacteristic(NB_AUTH_WRITE).catch((e) => {
             this.log('debug', `Caractéristique 0005 absente (${e.message}).`);
             return null;
           });
+          authNotify = await svc.getCharacteristic(NB_AUTH_NOTIFY).catch((e) => {
+            this.log('debug', `Caractéristique 0006 absente (${e.message}).`);
+            return null;
+          });
         }
+        channels.push({ label, write, notify, authNotify });
       } catch (err) {
         if (this._gattLost) throw err;
         this.log('debug', `Service ${label} absent (${err.message}).`);
@@ -409,7 +417,7 @@ export class Scooter extends EventTarget {
     if (!channels.length) throw new ScooterError('PROTOCOL', 'Aucun service Bluetooth Segway trouvé sur cet appareil.');
     this.channels = channels;
     this.writeChar = channels[0].write;
-    const notifyChars = channels.map((c) => c.notify);
+    const notifyChars = [...new Set(channels.flatMap((c) => [c.notify, c.authNotify].filter(Boolean)))];
     this._mark(`canaux trouvés : ${channels.map((c) => c.label).join(' + ')}`);
 
     for (const ch of this.notifyChars ?? []) ch.removeEventListener('characteristicvaluechanged', this._onNotify);
@@ -540,12 +548,12 @@ export class Scooter extends EventTarget {
         throw new ScooterError('ECHO', 'La trottinette renvoie la requête telle quelle (écho).');
       }
       const { plain, ok } = await this.crypto.decrypt(raw);
-      const frame = parseFrame(plain);
-      if (!ok) this.log('debug', `Contrôle d'intégrité invalide sur ${toHex(plain)}`);
-      if (frame && match(frame)) {
-        if (!ok) this.log('warn', 'Réponse acceptée malgré un contrôle d\'intégrité invalide.');
-        return frame;
+      if (!ok) {
+        this.log('debug', `Contrôle d'intégrité invalide sur ${toHex(plain)}`);
+        continue;
       }
+      const frame = parseFrame(plain);
+      if (frame && match(frame)) return frame;
       this.log('debug', `Trame ignorée : ${toHex(plain)}`);
     }
   }
@@ -588,11 +596,12 @@ export class Scooter extends EventTarget {
         throw err;
       }
       const { plain, ok } = await this.crypto.decrypt(raw);
-      const frame = parseFrame(plain);
-      if (frame && match(frame)) {
-        if (!ok) this.log('debug', 'Réponse acceptée malgré un contrôle d\'intégrité invalide.');
-        return frame;
+      if (!ok) {
+        this.log('debug', `Contrôle d'intégrité invalide sur ${toHex(plain)}`);
+        continue;
       }
+      const frame = parseFrame(plain);
+      if (frame && match(frame)) return frame;
       this.log('debug', `Trame ignorée : ${toHex(plain)}`);
     }
   }
@@ -607,7 +616,7 @@ export class Scooter extends EventTarget {
       try {
         return await this._transact(
           buildFrame(SYNC2, board, CMD.PRE_COMM, 0x00),
-          (f) => f.cmd === CMD.PRE_COMM && f.data.length >= 30,
+          (f) => (f.cmd === CMD.PRE_COMM || f.cmd === CMD.READ_ACK) && f.data.length >= 30,
           2500,
         );
       } catch (err) {

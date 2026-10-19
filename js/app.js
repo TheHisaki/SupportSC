@@ -6,7 +6,7 @@ import {
 } from './shortcuts.js';
 
 // Bumped on every deploy so you can check the phone shows the latest version.
-const APP_VERSION = '1.8.0';
+const APP_VERSION = '1.9.0';
 
 const $ = (id) => document.getElementById(id);
 

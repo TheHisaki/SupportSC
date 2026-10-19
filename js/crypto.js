@@ -52,6 +52,50 @@ export function randomBytes(n) {
   return globalThis.crypto.getRandomValues(new Uint8Array(n));
 }
 
+// The X3/ZT3 pairing password is produced by the Java-compatible generator
+// used by the public Ninebot BLE clients, not by random bytes. The scooter
+// accepts SET_PWD only when this value matches its current-time seed.
+const JAVA_MASK = (1n << 48n) - 1n;
+const JAVA_MULTIPLIER = 0x5deece66dn;
+const JAVA_ADDEND = 0xBn;
+
+function javaSigned32(value) {
+  const unsigned = value >>> 0;
+  return unsigned >= 0x80000000 ? unsigned - 0x100000000 : unsigned;
+}
+
+function pairingSeedOffset(authParam) {
+  let offset = 0n;
+  for (let i = 0; i < authParam.length; i++) {
+    // Java's source uses a signed byte and 32-bit shift semantics. Bitwise
+    // operators in JavaScript provide the required 32-bit shift behavior.
+    const signedByte = authParam[i] < 0x80 ? authParam[i] : authParam[i] - 0x100;
+    const shift = ((i % 8) * 8) & 31;
+    const value = javaSigned32(signedByte << shift);
+    offset = BigInt.asIntN(64, offset + BigInt(value));
+  }
+  return offset;
+}
+
+/** Generates the 16-byte SET_PWD password used by the ZT3/X3 firmware. */
+export async function generatePairingPassword(authParam, timestampMs = Date.now()) {
+  const timestamp = BigInt(Math.trunc(timestampMs));
+  const seed = BigInt.asIntN(64, timestamp + pairingSeedOffset(authParam));
+  let state = (seed ^ JAVA_MULTIPLIER) & JAVA_MASK;
+  const random = new Uint8Array(16);
+
+  for (let offset = 0; offset < random.length; offset += 4) {
+    state = (state * JAVA_MULTIPLIER + JAVA_ADDEND) & JAVA_MASK;
+    const nextInt = Number(state >> 16n) >>> 0;
+    for (let i = 0; i < 4 && offset + i < random.length; i++) {
+      random[offset + i] = (nextInt >>> (i * 8)) & 0xff;
+    }
+  }
+
+  const digest = await subtle.digest('SHA-256', random);
+  return new Uint8Array(digest, 0, 16).slice();
+}
+
 const aesKeyCache = new Map();
 
 async function importAesKey(rawKey) {
@@ -220,7 +264,11 @@ export class NbCrypto {
       const a0 = await aesEncryptBlock(key, ctrBlock(nonce, 0));
       const recvTag = tail.subarray(0, 4).map((b, i) => b ^ a0[i]);
       const expected = await cbcMac(key, plain, nonce);
-      return { plain, ok: bytesEqual(recvTag, expected) };
+      const ok = bytesEqual(recvTag, expected);
+      // A delayed/invalid notification must never rewind the send counter.
+      // Rewinding makes the next retry reuse a counter the scooter already saw.
+      if (ok && this.followPeer && counter > this.counter) this.counter = counter;
+      return { plain, ok };
     }
 
     const ks = await aesEncryptBlock(key, ecbInput);
