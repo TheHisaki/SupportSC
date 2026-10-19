@@ -11,24 +11,29 @@ const NORDIC_SERVICE = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
 const NORDIC_WRITE = '6e400002-b5a3-f393-e0a9-e50e24dcca9e';
 const NORDIC_NOTIFY = '6e400003-b5a3-f393-e0a9-e50e24dcca9e';
 
-// Pairing flow ported from the official Segway app logic for "x3" scooters (G3, GT3, ZT3), see
-// https://github.com/HeckerHeckt/Ninebot-Max-G3-Firmware-Flasher (ninebot_ble.py) and
-// https://nootnooot.codeberg.page/segway-ninebot-ble/authentication/ :
-//  - ONE BLE connection for the whole pairing, never closed while waiting for the Power button,
-//  - pairing target is the BLE board 0x04 for names starting with "1CG", else 0x21,
-//  - ONE password per attempt: SET_PWD is resent unchanged every 0.5 s (60 s max) until the
-//    scooter answers index 1 (index 0 = "waiting for the Power button"),
-//  - then AUTH (serial number) is resent every 0.5 s until index 1,
-//  - the message counter follows the scooter.
+const NB_AUTH_WRITE = '6e400005-0000-0000-006e-696e65626f74';
+
+// Pairing flow of the iOS GT3 Pro companion app, verified on a real x3 scooter with packet captures
+// (https://github.com/djensenius/gt3pro, ScooterConnectionManager.swift / NinebotAuth.swift),
+// cross-checked with https://nootnooot.codeberg.page/segway-ninebot-ble/authentication/ :
+//  1. toggle the CCCD of 006E-0004 (off, 300 ms, on, 200 ms drain),
+//  2. plain PRE_COMM "wakeup" (target 0x21, with checksum) written to 006E-0005,
+//  3. encrypted PRE_COMM (target 0x04) written to B5A3-0002, answer on B5A3-0003,
+//  4. SN mode ON (counter = 1), SET_PWD encrypted with key (name, auth). The scooter answers
+//     index 0 while it waits for the Power button, index 1 once pressed. Resent every 2 s.
+//  5. AUTH (serial number) with key (password, auth) -> index 1 = authenticated.
+// Logs from a real ZT3 showed that SET_PWD sent in non-SN mode (counter 0, previous versions)
+// is answered "1" without any button press, then the scooter drops the link on AUTH.
+// That older encoding is kept as a fallback ("legacy") in case the SN one gets no answer.
 const SYNC2 = 0xa5;
-const BLE_BOARD_NEW = 0x04;
-const BLE_BOARD_LEGACY = 0x21;
-const RESEND_MS = 500;
-const SET_PWD_BURST = 4; // the official app sends SET_PWD 4 times before starting the 0.5 s loop
-const PROMPT_AFTER_MS = 2500; // show "press Power" only if the scooter does not accept right away
-const AUTH_TIMEOUT_MS = 10_000;
-const MAX_AUTH_REFUSALS = 3;
-const MAX_RECONNECTS = 3; // only when the scooter itself drops the link (1 s, 2 s, 3 s backoff)
+const BOARD_AUTH = 0x04; // x3 auth target: the only board that answered PRE_COMM on a real ZT3
+const BOARD_BLE = 0x21;
+const SET_PWD_RESEND_MS = { sn: 2000, legacy: 500 };
+const SET_PWD_SILENT_MS = 6500; // no SET_PWD answer at all after ~3 sends -> wrong encoding
+const AUTH_RESEND_MS = 2000;
+const AUTH_TRIES = 3;
+const MAX_RECONNECTS = 3; // only when the scooter drops the link or stays silent (1 s, 2 s, 3 s backoff)
+const otherVariant = (v) => (v === 'sn' ? 'legacy' : 'sn');
 
 // Ninebot/Segway company ids found in BLE advertisements (both byte orders are seen in the wild).
 const NINEBOT_COMPANY_IDS = [0x4e42, 0x4e43, 0x424e, 0x434e];
@@ -67,7 +72,7 @@ export class Scooter extends EventTarget {
     this.writeChar = null;
     this.channels = [];
     this.notifyChars = [];
-    this.peer = BLE_BOARD_LEGACY;
+    this.peer = BOARD_AUTH;
     this._assemblers = null;
     this._gattLost = false;
     this._t0 = 0;
@@ -138,67 +143,57 @@ export class Scooter extends EventTarget {
 
     this.log('info', `Navigateur : ${navigator.userAgent}`);
 
-    // Official app: pairing targets BLE board 0x04 for "1CG…" names, else 0x21. Try the other as fallback.
-    const is1CG = this.btName.toUpperCase().startsWith('1CG');
-    const boards = is1CG ? [BLE_BOARD_NEW, BLE_BOARD_LEGACY] : [BLE_BOARD_LEGACY, BLE_BOARD_NEW];
+    // SET_PWD encoding: "sn" (official app / docs) unless "legacy" already worked on this scooter.
+    const variantKey = `zt3:variant:${this.btName}`;
+    let variant = storage.get(variantKey) === 'legacy' ? 'legacy' : 'sn';
+    this._workingBoard = null;
 
-    const board = await this._findBoard(boards);
-
-    // A password this site already registered on the scooter is accepted without the button.
-    // Otherwise a new one is generated and kept for the whole attempt (never regenerated
-    // while the user is pressing Power, or the press would confirm a password we dropped).
-    const stored = storage.get(`zt3:pwd:${this.serial}`);
-    let password = stored ? fromHex(stored) : randomBytes(16);
-    if (stored) this.log('info', 'Mot de passe déjà enregistré pour cette trottinette, essai sans bouton.');
-
-    const deadline = Date.now() + PAIRING_TIMEOUT_MS;
-    let prompted = false;
-    const prompt = () => {
-      if (prompted) return;
-      prompted = true;
-      this._progress('Appuie sur Power…');
-      this.dispatchEvent(new Event('pairing-request'));
+    const ctx = {
+      deadline: null, // starts at the first SET_PWD, so connection retries don't eat the 60 s
+      prompted: false,
+      prompt: () => {
+        if (ctx.prompted) return;
+        ctx.prompted = true;
+        this._progress('Appuie sur Power…');
+        this.dispatchEvent(new Event('pairing-request'));
+      },
     };
     let reconnects = 0;
-    let refusals = 0;
 
     try {
       for (;;) {
         try {
-          if (await this._pairOnce(password, deadline, prompt)) {
-            storage.set(`zt3:pwd:${this.serial}`, toHex(password, ''));
-            this._finishConnected();
-            return;
-          }
-          // AUTH refused: the scooter did not keep this password. Restart SET_PWD with a new one
-          // on the same connection, like the official app.
-          refusals++;
-          storage.remove(`zt3:pwd:${this.serial}`);
-          this.log('warn', `AUTH refusée (${refusals}/${MAX_AUTH_REFUSALS}), nouveau mot de passe.`);
-          if (refusals >= MAX_AUTH_REFUSALS) {
-            throw new ScooterError('AUTH', "La trottinette refuse l'authentification. Éteins-la, rallume-la et réessaie.");
-          }
-          password = randomBytes(16);
+          const pre = await this._openAndPreComm();
+          await this._authenticate(pre, variant, ctx);
+          storage.set(variantKey, variant);
+          this._finishConnected();
+          return;
         } catch (rawErr) {
           const err = this._normalizeError(rawErr);
           if (err.code === 'TIMEOUT' && this._step.startsWith('SET_PWD')) throw this._notConfirmedError();
-          // Reconnect only if the scooter itself dropped the link (or echoes), never on a timeout.
-          if (!['DISCONNECTED', 'ECHO'].includes(err.code) || reconnects >= MAX_RECONNECTS || Date.now() >= deadline) {
-            throw err;
+          const retryable = ['DISCONNECTED', 'ECHO', 'SILENT', 'AUTH_REFUSED'].includes(err.code);
+          if (!retryable || reconnects >= MAX_RECONNECTS || (ctx.deadline && Date.now() >= ctx.deadline)) {
+            throw err.code === 'AUTH_REFUSED'
+              ? new ScooterError('AUTH', "La trottinette refuse l'authentification. Éteins-la, rallume-la et réessaie.")
+              : err;
           }
           reconnects++;
+          // The scooter said "waiting for Power" with this encoding: it is the right one, keep it.
+          // Otherwise (silence, immediate "OK" then drop on AUTH) try the other encoding.
+          if (!this._sawWaiting && err.code !== 'ECHO') {
+            variant = otherVariant(variant);
+            this.log('info', `Essai suivant avec l'encodage SET_PWD « ${variant} ».`);
+          }
           this.log('warn', `${err.message} Reconnexion ${reconnects}/${MAX_RECONNECTS} dans ${reconnects} s…`);
           await this._closeGatt();
           await sleep(1000 * reconnects);
-          await this._openGatt({ toggleCccd: true });
-          await this._freshHandshakeStart(board);
         }
       }
     } catch (err) {
       await this._closeGatt();
       throw err;
     } finally {
-      if (prompted) this.dispatchEvent(new Event('pairing-done'));
+      if (ctx.prompted) this.dispatchEvent(new Event('pairing-done'));
     }
   }
 
@@ -209,21 +204,25 @@ export class Scooter extends EventTarget {
       "et ScooterHacking sont complètement fermées : une seule appli peut être connectée à la fois.");
   }
 
-  /** Opens GATT and finds the board that answers PRE_COMM. Leaves the connection open. */
-  async _findBoard(boards) {
-    for (const candidate of boards) {
+  /** Opens GATT and runs PRE_COMM (board 0x04 first, 0x21 as fallback). Leaves the connection open. */
+  async _openAndPreComm() {
+    const boards = this._workingBoard ? [this._workingBoard] : [BOARD_AUTH, BOARD_BLE];
+    let lastErr = null;
+    for (const board of boards) {
       try {
         await this._openGatt({ toggleCccd: true });
-        await this._freshHandshakeStart(candidate);
-        return candidate;
+        const pre = await this._freshHandshakeStart(board);
+        this._workingBoard = board;
+        return pre;
       } catch (rawErr) {
-        const err = this._normalizeError(rawErr);
-        this.log('warn', `Carte 0x${candidate.toString(16)} : ${err.message}`);
+        lastErr = this._normalizeError(rawErr);
+        this.log('warn', `Carte 0x${board.toString(16)} : ${lastErr.message}`);
         await this._closeGatt();
         await sleep(1000);
       }
     }
-    throw new ScooterError('TIMEOUT',
+    if (lastErr?.code === 'DISCONNECTED' || lastErr?.code === 'ECHO') throw lastErr;
+    throw new ScooterError('NO_PRECOMM',
       "La trottinette ne répond pas à la demande d'appairage. Ferme complètement ScooterHacking Utility et l'appli " +
       "Segway, éteins puis rallume la trottinette, puis réessaie.");
   }
@@ -240,6 +239,7 @@ export class Scooter extends EventTarget {
     this.crypto = new NbCrypto(FW_DATA, { followPeer: true });
     this.sync2 = SYNC2;
     this.pairBoard = board;
+    await this._sendWakeup();
     const pre = await this._preComm(board);
     this.peer = pre.source;
     this._auth = pre.data.slice(0, 16);
@@ -250,44 +250,98 @@ export class Scooter extends EventTarget {
     return pre;
   }
 
-  /**
-   * SET_PWD then AUTH on the current connection, with the same `password` throughout.
-   * Waits up to `deadline` for the Power button (calls `onWaiting` once the wait is noticeable).
-   * Returns true when authenticated, false when the scooter refused AUTH.
-   * Throws TIMEOUT (step SET_PWD) if Power was never confirmed, DISCONNECTED if the link dropped.
-   */
-  async _pairOnce(password, deadline, onWaiting) {
-    this.crypto.setKey(utf8(this.btName), this._auth);
-    this._mark('SET_PWD (envoi toutes les 0,5 s, même mot de passe)');
-    const promptTimer = setTimeout(onWaiting, PROMPT_AFTER_MS);
-    let pendingSeen = false;
+  /** Plain PRE_COMM to the BLE board on 006E-0005, sent by the official app before the real one. */
+  async _sendWakeup() {
+    if (!this.authWriteChar) return;
+    const frame = buildFrame(SYNC2, BOARD_BLE, CMD.PRE_COMM, 0x00);
+    let sum = 0;
+    for (const b of frame.subarray(2)) sum += b;
+    const chk = ~sum & 0xffff;
+    const out = Uint8Array.of(...frame, chk & 0xff, chk >> 8);
+    this.log('debug', `TX (réveil, 0005) ${toHex(out)}`);
     try {
-      await this._repeatUntil(buildFrame(SYNC2, this.peer, CMD.SET_PWD, 0x00, password), (f) => {
-        if (f.cmd !== CMD.SET_PWD) return false;
-        if (f.index === 1) return true;
-        if (!pendingSeen) {
-          pendingSeen = true;
-          this.log('info', `[${this._elapsed()}] la trottinette attend l'appui sur Power`);
-          onWaiting();
-        }
-        return false;
-      }, { timeoutMs: Math.max(0, deadline - Date.now()), burst: SET_PWD_BURST });
-    } finally {
-      clearTimeout(promptTimer);
+      if (this.authWriteChar.writeValueWithResponse) await this.authWriteChar.writeValueWithResponse(out);
+      else await this.authWriteChar.writeValue(out);
+    } catch (err) {
+      if (this._gattLost) throw err;
+      this.log('debug', `Réveil 0005 ignoré : ${err.message}`);
     }
-    this._mark('SET_PWD accepté (Power confirmé)');
+  }
+
+  /**
+   * Handshake after PRE_COMM, on the current connection:
+   * stored password -> AUTH directly; otherwise SET_PWD (waits for Power) then AUTH.
+   * `variant` = "sn" (SET_PWD in SN mode, counter 2) or "legacy" (SET_PWD in non-SN mode).
+   * Throws DISCONNECTED / SILENT / AUTH_REFUSED (retryable) or TIMEOUT at step SET_PWD.
+   */
+  async _authenticate(pre, variant, ctx) {
+    this._sawWaiting = false;
+    if (variant === 'sn') this.crypto.startSn();
+
+    const stored = storage.get(`zt3:pwd:${this.serial}`);
+    if (stored && pre.index !== 0) {
+      this.crypto.setKey(fromHex(stored), this._auth);
+      if (await this._sendAuth('AUTH avec le mot de passe enregistré (sans bouton)')) return;
+      storage.remove(`zt3:pwd:${this.serial}`);
+      this.log('warn', 'Mot de passe enregistré refusé, nouvel appairage.');
+    }
+
+    // New password for this connection, kept unchanged while waiting for the button.
+    const password = randomBytes(16);
+    this.crypto.setKey(utf8(this.btName), this._auth);
+    ctx.deadline ??= Date.now() + PAIRING_TIMEOUT_MS;
+    ctx.prompt();
+    this._mark(`SET_PWD (encodage ${variant}) — appuie sur Power`);
+    const frame = buildFrame(SYNC2, this.peer, CMD.SET_PWD, 0x00, password);
+    let answered = false;
+    const match = (f) => {
+      if (f.cmd !== CMD.SET_PWD) return false;
+      answered = true;
+      if (f.index === 1) return true;
+      if (!this._sawWaiting) {
+        this._sawWaiting = true;
+        this.log('info', `[${this._elapsed()}] la trottinette attend l'appui sur Power (réponse 0)`);
+      }
+      return false;
+    };
+    for (;;) {
+      const remaining = ctx.deadline - Date.now();
+      if (remaining <= 0) throw new ScooterError('TIMEOUT', 'Power non confirmé.');
+      try {
+        await this._repeatUntil(frame, match, {
+          timeoutMs: answered ? remaining : Math.min(remaining, SET_PWD_SILENT_MS),
+          intervalMs: SET_PWD_RESEND_MS[variant],
+        });
+        break;
+      } catch (err) {
+        if (err.code !== 'TIMEOUT') throw err;
+        if (!answered) throw new ScooterError('SILENT', `Pas de réponse à SET_PWD (encodage ${variant}).`);
+      }
+    }
+    this._mark(this._sawWaiting ? 'SET_PWD accepté (Power confirmé)' : 'SET_PWD accepté tout de suite');
 
     this.crypto.setKey(password, this._auth);
-    this._mark('AUTH');
+    if (!(await this._sendAuth('AUTH'))) {
+      throw new ScooterError('AUTH_REFUSED', 'AUTH refusée par la trottinette.');
+    }
+    storage.set(`zt3:pwd:${this.serial}`, toHex(password, ''));
+  }
+
+  /** Sends AUTH (serial number) with the current key. Returns true if the scooter answers index 1. */
+  async _sendAuth(label) {
+    this._mark(label);
     let res;
     try {
       res = await this._repeatUntil(buildFrame(SYNC2, this.peer, CMD.AUTH, 0x00, this._sn),
-        (f) => f.cmd === CMD.AUTH, { timeoutMs: AUTH_TIMEOUT_MS });
+        (f) => f.cmd === CMD.AUTH, { timeoutMs: AUTH_RESEND_MS * AUTH_TRIES, intervalMs: AUTH_RESEND_MS });
     } catch (err) {
       if (err.code !== 'TIMEOUT') throw err;
       return false;
     }
-    if (res.index !== 1) return false;
+    if (res.index !== 1) {
+      this.log('warn', `[${this._elapsed()}] AUTH : réponse ${res.index}`);
+      return false;
+    }
     this._mark('authentifié');
     return true;
   }
@@ -323,6 +377,7 @@ export class Scooter extends EventTarget {
     this._t0 = performance.now();
     this._rxQueue = [];
     this._lastRx = null;
+    this.authWriteChar = null;
     this._mark('connexion GATT');
     const server = await this.device.gatt.connect();
     this._mark('GATT connecté, recherche du service');
@@ -340,6 +395,12 @@ export class Scooter extends EventTarget {
           write: await svc.getCharacteristic(writeUuid),
           notify: await svc.getCharacteristic(notifyUuid),
         });
+        if (svcUuid === NB_SERVICE) {
+          this.authWriteChar = await svc.getCharacteristic(NB_AUTH_WRITE).catch((e) => {
+            this.log('debug', `Caractéristique 0005 absente (${e.message}).`);
+            return null;
+          });
+        }
       } catch (err) {
         if (this._gattLost) throw err;
         this.log('debug', `Service ${label} absent (${err.message}).`);
@@ -359,7 +420,8 @@ export class Scooter extends EventTarget {
       // Bluefy has been reported to deliver notifications only through the on* handler.
       try { ch.oncharacteristicvaluechanged = this._onNotify; } catch { /* read-only in some engines */ }
       await ch.startNotifications();
-      if (toggleCccd) {
+      // Official app: only 006E-0004 is toggled; B5A3-0003 is just subscribed.
+      if (toggleCccd && ch.uuid === NB_NOTIFY) {
         // iOS keeps CCCD state between connections: toggle it to get a clean subscription.
         try {
           await ch.stopNotifications();
@@ -507,7 +569,7 @@ export class Scooter extends EventTarget {
    * Sends `plainFrame` (re-encrypted each time) every `intervalMs` until a response matches,
    * like the official app does for SET_PWD / AUTH. `burst` copies are sent on the first round.
    */
-  async _repeatUntil(plainFrame, match, { timeoutMs, intervalMs = RESEND_MS, burst = 1 }) {
+  async _repeatUntil(plainFrame, match, { timeoutMs, intervalMs = 500, burst = 1 }) {
     this._rxQueue = [];
     const deadline = Date.now() + timeoutMs;
     let nextSend = 0;
