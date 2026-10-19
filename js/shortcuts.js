@@ -96,12 +96,18 @@ export async function setModeSpeed(scooter, modeKey, kmh, log = () => {}) {
       + `(${pair.max[0]} / ${pair.max[1]} km/h) et pas encore vérifié en roulant.`);
   }
 
-  const target = Math.min(Math.max(kmh, pair.min[byte]), pair.max[byte]);
-  if (target !== kmh) {
-    log('warn', `Ce mode accepte ${pair.min[byte]}–${pair.max[byte]} km/h : ${kmh} ramené à ${target}.`);
+  // A value outside the range the vehicle advertises is still sent: it is its own register,
+  // and the read-back tells the truth about what it accepted. Only values that cannot fit
+  // in the byte are refused outright.
+  const target = kmh;
+  const beyond = target < pair.min[byte] || target > pair.max[byte];
+  if (beyond) {
+    log('warn', `Ce mode annonce ${pair.min[byte]}–${pair.max[byte]} km/h. ${target} sort de cette `
+      + 'plage : on écrit quand même, puis on relit ce que la trottinette garde.');
   }
 
   const from = pair.value[byte];
+  let kept = from;
   if (from !== target) {
     const bytes = Uint8Array.from(pair.value);
     bytes[byte] = target;
@@ -111,20 +117,22 @@ export async function setModeSpeed(scooter, modeKey, kmh, log = () => {}) {
     await sleep(300);
 
     const after = await readGearPair(scooter, mode.pair);
+    kept = after.value?.[byte] ?? null;
     log('info', `${pair.label} relu = ${pairText(after.value)}`);
-    if (after.value?.[byte] !== target) {
-      throw new Error(`La trottinette a gardé ${fmt(after.value?.[byte])} km/h au lieu de ${target} km/h.`);
+    if (kept !== target) {
+      if (!beyond) throw new Error(`La trottinette a gardé ${fmt(kept)} km/h au lieu de ${target} km/h.`);
+      log('warn', `La trottinette a refusé ${target} et garde ${fmt(kept)} km/h.`);
     }
   }
 
   // The Segway app keeps a plain-km/h copy of the Sport limit in 0x6E, and it was observed
   // going stale (0x48 said 25 while 0x6E still said 20). Realign it on every run.
-  if (mode.mirrorReg !== null) {
+  if (mode.mirrorReg !== null && Number.isInteger(kept)) {
     try {
       const mirror = await scooter.probeRegister(BOARD.VCU, mode.mirrorReg, 2);
       const current = mirror && mirror.length >= 2 ? mirror[0] | (mirror[1] << 8) : null;
-      if (current !== target) {
-        await scooter.writeU16(BOARD.VCU, mode.mirrorReg, target);
+      if (current !== kept) {
+        await scooter.writeU16(BOARD.VCU, mode.mirrorReg, kept);
         await sleep(200);
         const back = await scooter.probeRegister(BOARD.VCU, mode.mirrorReg, 2);
         const read = back && back.length >= 2 ? back[0] | (back[1] << 8) : null;
@@ -135,7 +143,14 @@ export async function setModeSpeed(scooter, modeKey, kmh, log = () => {}) {
     }
   }
 
-  return { changed: from !== target, from, kmh: target, via: `0x${hex(pair.reg)} octet ${byte}` };
+  return {
+    changed: kept !== from,
+    from,
+    kmh: kept,
+    requested: kmh,
+    refused: kept !== kmh,
+    via: `0x${hex(pair.reg)} octet ${byte}`,
+  };
 }
 
 export async function runShortcut(scooter, shortcut, log) {

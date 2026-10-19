@@ -29,13 +29,15 @@ const NB_AUTH_NOTIFY = '6e400006-0000-0000-006e-696e65626f74';
 const SYNC2 = 0xa5;
 const BOARD_AUTH = 0x04; // x3 auth target: the only board that answered PRE_COMM on a real ZT3
 const BOARD_BLE = 0x21;
-const SET_PWD_RESEND_MS = { sn: 1000, legacy: 400 };
+const SET_PWD_RESEND_MS = { sn: 1000, legacy: 500 }; // 500 ms is the cadence that paired a real ZT3
 const SET_PWD_SILENT_MS = 6500; // no SET_PWD answer at all after several sends -> wrong encoding
 const AUTH_RESEND_MS = 800; // a real ZT3 ignored the first two AUTH frames sent after SET_PWD
 const AUTH_WINDOW_MS = 6000;
-// Opening the Segway app overwrites the key stored in the vehicle, so a stored key that no
-// longer works must be dropped fast instead of being retried on every board and counter.
-const STORED_PWD_WINDOW_MS = 1800;
+// Opening the Segway app overwrites the key stored in the vehicle. A valid key answers on
+// the first frame, in well under a second; anything slower means it is dead, so give it one
+// short window and move straight to pairing.
+const STORED_PWD_WINDOW_MS = 900;
+const RECONNECT_DELAY_MS = 800;
 const MAX_RECONNECTS = 3; // only when the scooter drops the link or stays silent (1 s, 2 s, 3 s backoff)
 const otherVariant = (v) => (v === 'sn' ? 'legacy' : 'sn');
 
@@ -148,9 +150,15 @@ export class Scooter extends EventTarget {
     this.log('info', `Navigateur : ${navigator.userAgent}`);
 
     // SET_PWD encoding: "sn" (official app / docs) unless "legacy" already worked on this scooter.
+    // Once an encoding has paired this scooter, stop second-guessing it: keep resending
+    // SET_PWD for the whole window instead of giving up and switching encodings, which made
+    // the Power prompt restart over and over and swallowed the user's button presses.
     const variantKey = `zt3:variant:${this.btName}`;
-    let variant = storage.get(variantKey) === 'legacy' ? 'legacy' : 'sn';
+    const knownVariant = storage.get(variantKey);
+    const variantConfirmed = knownVariant === 'sn' || knownVariant === 'legacy';
+    let variant = knownVariant === 'legacy' ? 'legacy' : 'sn';
     this._workingBoard = null;
+    this._pairPassword = null; // one pairing key for this whole connect(), reconnects included
 
     const ctx = {
       deadline: null, // starts at the first SET_PWD, so connection retries don't eat the 60 s
@@ -175,7 +183,7 @@ export class Scooter extends EventTarget {
             variant = 'legacy';
             this.log('info', 'Appairage existant détecté : essai du flux legacy compatible SHU.');
           }
-          await this._authenticate(pre, variant, ctx);
+          await this._authenticate(pre, variant, ctx, { variantConfirmed });
           storage.set(variantKey, variant);
           this._finishConnected();
           return;
@@ -184,22 +192,27 @@ export class Scooter extends EventTarget {
           if (err.code === 'TIMEOUT' && this._step.startsWith('SET_PWD')) throw this._notConfirmedError();
           const retryable = ['DISCONNECTED', 'ECHO', 'SILENT', 'AUTH_REFUSED'].includes(err.code);
           if (!retryable || reconnects >= MAX_RECONNECTS || (ctx.deadline && Date.now() >= ctx.deadline)) {
-            throw err.code === 'AUTH_REFUSED'
-              ? new ScooterError('AUTH', "La trottinette refuse l'authentification. Éteins-la, rallume-la et réessaie.")
-              : err;
+            if (err.code === 'AUTH_REFUSED') {
+              throw new ScooterError('AUTH', "La trottinette refuse l'authentification. Éteins-la, rallume-la et réessaie.");
+            }
+            if (err.code === 'DISCONNECTED') {
+              throw new ScooterError('DISCONNECTED', 'La trottinette a coupé la connexion plusieurs fois de suite. '
+                + "Éteins-la puis rallume-la, vérifie que l'appli Segway est complètement fermée, et réessaie.");
+            }
+            throw err;
           }
           reconnects++;
           // The scooter said "waiting for Power" with this encoding: it is the right one, keep it.
           // Otherwise (silence, immediate "OK" then drop on AUTH) try the other encoding.
           // A failure before SET_PWD (stale stored key refused) says nothing about the
           // encoding: switching variants there used to throw away a known-good setting.
-          if (this._triedSetPwd && !this._sawWaiting && err.code !== 'ECHO') {
+          if (!variantConfirmed && this._triedSetPwd && !this._sawWaiting && err.code !== 'ECHO') {
             variant = otherVariant(variant);
             this.log('info', `Essai suivant avec l'encodage SET_PWD « ${variant} ».`);
           }
-          this.log('warn', `${err.message} Reconnexion ${reconnects}/${MAX_RECONNECTS} dans ${reconnects} s…`);
+          this.log('warn', `${err.message} Reconnexion ${reconnects}/${MAX_RECONNECTS}…`);
           await this._closeGatt();
-          await sleep(1000 * reconnects);
+          await sleep(RECONNECT_DELAY_MS);
         }
       }
     } catch (err) {
@@ -287,32 +300,44 @@ export class Scooter extends EventTarget {
    * `variant` = "sn" (SET_PWD in SN mode, counter 2) or "legacy" (SET_PWD in non-SN mode).
    * Throws DISCONNECTED / SILENT / AUTH_REFUSED (retryable) or TIMEOUT at step SET_PWD.
    */
-  async _authenticate(pre, variant, ctx) {
+  async _authenticate(pre, variant, ctx, { variantConfirmed = false } = {}) {
     this._sawWaiting = false;
     this._triedSetPwd = false;
     if (variant === 'sn') this.crypto.startSn();
 
-    const stored = storage.get(`zt3:pwd:${this.serial}`);
+    const pwdKey = `zt3:pwd:${this.serial}`;
+    const stored = storage.get(pwdKey);
     if (stored && pre.index !== 0) {
+      // A key the Segway app has replaced gets no answer at all, and the vehicle then cuts
+      // the link after a few AUTH frames. Forget the key *before* trying it: the disconnect
+      // used to skip the cleanup below, so every reconnect died on the same dead key.
+      storage.remove(pwdKey);
       if (this.crypto.counter === 0) this.crypto.startSn();
       this.crypto.setKey(fromHex(stored), this._auth);
+      // A valid key answers on counter 2 within milliseconds. Trying counter 3 on top only
+      // gave the vehicle one more reason to drop the connection.
       if (await this._sendAuth('AUTH avec la clé enregistrée (sans bouton)', {
         targets: [this.pairBoard],
-        counters: [2, 3],
+        counters: [2],
         windowMs: STORED_PWD_WINDOW_MS,
         intervalMs: 600,
         stopOnRefusal: true,
-      })) return;
-      storage.remove(`zt3:pwd:${this.serial}`);
-      this.log('warn', "Clé enregistrée refusée : l'appli Segway l'a remplacée dans la trottinette. "
-        + 'Un nouvel appui sur Power est nécessaire.');
+      })) {
+        storage.set(pwdKey, stored);
+        return;
+      }
+      this.log('warn', "Clé enregistrée plus valable (l'appli Segway l'a remplacée) : "
+        + 'nouvel appairage, un appui court sur Power suffira.');
     }
 
-    // X3/ZT3 legacy pairing uses a random app key for SET_PWD. This is the
-    // flow used by the public NinebotCrypto clients and by SHU-compatible
-    // firmware paths; keep the same 16 bytes for every retry in this session.
+    // X3/ZT3 legacy pairing uses a random app key for SET_PWD, the flow used by the public
+    // NinebotCrypto clients and by SHU-compatible firmware paths. The same 16 bytes must be
+    // reused across reconnects: a fresh random key on every retry made the vehicle treat it
+    // as a brand new pairing request and restart its Power prompt, so the user's press kept
+    // landing on a request that had already been replaced. The "sn" key is derived from the
+    // PRE_COMM nonce, which changes per connection, so it cannot be cached.
     const password = variant === 'legacy'
-      ? randomBytes(16)
+      ? (this._pairPassword ??= randomBytes(16))
       : await generatePairingPassword(this._auth);
     this.crypto.setKey(utf8(this.btName), this._auth);
     ctx.deadline ??= Date.now() + PAIRING_TIMEOUT_MS;
@@ -329,6 +354,8 @@ export class Scooter extends EventTarget {
       if (!this._sawWaiting) {
         this._sawWaiting = true;
         this.log('info', `[${this._elapsed()}] la trottinette attend l'appui sur Power (réponse 0)`);
+        // Tells the UI the vehicle is armed, so one short press is now enough.
+        this.dispatchEvent(new Event('pairing-armed'));
       }
       return false;
     };
@@ -337,7 +364,9 @@ export class Scooter extends EventTarget {
       if (remaining <= 0) throw new ScooterError('TIMEOUT', 'Power non confirmé.');
       try {
         await this._repeatUntil(frame, match, {
-          timeoutMs: answered ? remaining : Math.min(remaining, SET_PWD_SILENT_MS),
+          // Keep asking for the whole window once the encoding is known to work: bailing
+          // out early is what kept restarting the prompt between the user's presses.
+          timeoutMs: answered || variantConfirmed ? remaining : Math.min(remaining, SET_PWD_SILENT_MS),
           intervalMs: SET_PWD_RESEND_MS[variant],
           onInvalid: () => { invalid++; },
         });

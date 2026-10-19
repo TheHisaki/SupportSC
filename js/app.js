@@ -10,7 +10,7 @@ import {
 } from './diagnostic.js';
 
 // Bumped on every deploy so you can check the phone shows the latest version.
-const APP_VERSION = '1.14.0';
+const APP_VERSION = '1.15.0';
 
 const $ = (id) => document.getElementById(id);
 const fmt = (v) => (v === null || v === undefined ? '–' : v);
@@ -55,6 +55,7 @@ const ui = {
   copyLog: $('btn-copy-log'),
   clearLog: $('btn-clear-log'),
   pairing: $('pairing'),
+  pairingArmed: $('pairing-armed'),
   toast: $('toast'),
 };
 
@@ -125,7 +126,12 @@ async function withBusy(button, fn) {
 const scooter = new Scooter({ log });
 
 scooter.addEventListener('progress', (e) => { setStatus('busy', e.detail); log('info', e.detail); });
-scooter.addEventListener('pairing-request', () => { ui.pairing.hidden = false; });
+scooter.addEventListener('pairing-request', () => {
+  ui.pairing.hidden = false;
+  ui.pairingArmed.hidden = true;
+});
+// The scooter confirmed it is waiting for the button: from here one short press is enough.
+scooter.addEventListener('pairing-armed', () => { ui.pairingArmed.hidden = false; });
 scooter.addEventListener('pairing-done', () => { ui.pairing.hidden = true; });
 scooter.addEventListener('disconnected', () => {
   updateConnectionUi();
@@ -227,11 +233,13 @@ function renderShortcuts() {
     run.addEventListener('click', () => withBusy(run, async () => {
       log('info', `Raccourci : ${shortcutLabel(sc)}`);
       const result = await runShortcut(scooter, sc, log);
-      const msg = result.changed
-        ? `Mode ${sc.mode} réglé à ${result.kmh} km/h`
-        : `Mode ${sc.mode} déjà à ${result.kmh} km/h`;
-      toast(msg);
-      log('info', `${msg} (via ${result.via})`);
+      const msg = result.refused
+        ? `Mode ${sc.mode} : ${result.requested} km/h refusé, la trottinette garde ${fmt(result.kmh)} km/h`
+        : result.changed
+          ? `Mode ${sc.mode} réglé à ${result.kmh} km/h`
+          : `Mode ${sc.mode} déjà à ${result.kmh} km/h`;
+      toast(msg, result.refused ? 'error' : 'ok');
+      log(result.refused ? 'warn' : 'info', `${msg} (via ${result.via})`);
       await refreshDashboard();
     }));
     li.appendChild(run);

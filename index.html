@@ -82,10 +82,11 @@
           </div>
           <div class="field">
             <label for="sc-speed">Vitesse (km/h)</label>
-            <input id="sc-speed" type="number" inputmode="numeric" min="6" max="25" step="1" value="20" required>
+            <input id="sc-speed" type="number" inputmode="numeric" min="0" max="100" step="1" value="25" required>
           </div>
         </div>
         <button class="btn" type="submit">Ajouter</button>
+        <p class="hint">N'importe quelle valeur de 0 à 100 est acceptée. La trottinette annonce ses propres limites (40 km/h max en mode S) : si elle refuse, le site te dit la valeur qu'elle a gardée. Au-delà de 25 km/h, la circulation sur la voie publique n'est pas autorisée en France.</p>
       </form>
     </section>
 
@@ -160,6 +161,7 @@
     <div class="overlay-box">
       <h2 id="pairing-title">Confirme sur la trottinette</h2>
       <p>Fais un appui <strong>court</strong> sur le bouton Power de la trottinette pour autoriser l'appairage (pas d'appui long, ça l'éteindrait).</p>
+      <p id="pairing-armed" class="armed" hidden>La trottinette a confirmé qu'elle attend : <strong>un seul appui court</strong> suffit maintenant.</p>
       <p class="hint">La connexion reste ouverte pendant 60 secondes. Si rien ne se passe après quelques secondes, refais un appui court. Normal après un passage par l'appli Segway : elle a remplacé notre clé dans la trottinette.</p>
       <div class="spinner" aria-hidden="true"></div>
     </div>

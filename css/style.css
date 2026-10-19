@@ -176,6 +176,8 @@ select {
   max-width: 360px;
   text-align: center;
 }
+.armed { color: var(--ok); font-weight: 600; }
+.armed[hidden] { display: none; }
 
 .spinner {
   width: 36px;

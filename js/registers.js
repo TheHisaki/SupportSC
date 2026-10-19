@@ -73,6 +73,10 @@ export const SPEED_MODES = Object.freeze({
   S: { key: 'S', label: 'Mode S (Sport)', pair: 'SR', byte: 1, mirrorReg: REG.S_GEAR_SPEED, proven: true },
 });
 
-// Legal limit for e-scooters on public roads in France / EU (and the EU firmware cap).
-export const MAX_SPEED_KMH = 25;
-export const MIN_SPEED_KMH = 6;
+// Range the speed input accepts. The vehicle's own limits are not guessed: they are read
+// from its min/max registers at write time, and whatever it keeps is reported back.
+export const MAX_SPEED_KMH = 100;
+export const MIN_SPEED_KMH = 0;
+
+// Legal limit for e-scooters on public roads in France / EU.
+export const LEGAL_SPEED_KMH = 25;
