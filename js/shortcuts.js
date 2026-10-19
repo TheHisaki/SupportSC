@@ -35,8 +35,14 @@ export function isValidSpeed(kmh) {
   return Number.isInteger(kmh) && kmh >= MIN_SPEED_KMH && kmh <= MAX_SPEED_KMH;
 }
 
+/** Button text, kept deliberately terse: "S → 20". */
 export function shortcutLabel(s) {
-  return `Mode ${s.mode} → ${s.kmh} km/h`;
+  return `${s.mode} → ${s.kmh}`;
+}
+
+/** Spoken/assistive description, where the unit matters. */
+export function shortcutDescription(s) {
+  return `mode ${s.mode} à ${s.kmh} km/h`;
 }
 
 function describe(pair, byte) {

@@ -38,6 +38,10 @@ const AUTH_WINDOW_MS = 6000;
 // short window and move straight to pairing.
 const STORED_PWD_WINDOW_MS = 900;
 const RECONNECT_DELAY_MS = 800;
+// The Power prompt only goes up once the request is really pending: either the vehicle said
+// it is waiting, or it stayed quiet this long. A scooter that accepts SET_PWD straight away
+// never shows the prompt at all.
+const PROMPT_GRACE_MS = 1500;
 const MAX_RECONNECTS = 3; // only when the scooter drops the link or stays silent (1 s, 2 s, 3 s backoff)
 const otherVariant = (v) => (v === 'sn' ? 'legacy' : 'sn');
 
@@ -341,7 +345,6 @@ export class Scooter extends EventTarget {
       : await generatePairingPassword(this._auth);
     this.crypto.setKey(utf8(this.btName), this._auth);
     ctx.deadline ??= Date.now() + PAIRING_TIMEOUT_MS;
-    ctx.prompt();
     this._triedSetPwd = true;
     this._mark(`SET_PWD (encodage ${variant}) — appuie sur Power`);
     const frame = buildFrame(SYNC2, BOARD_AUTH, CMD.SET_PWD, 0x00, password);
@@ -354,32 +357,38 @@ export class Scooter extends EventTarget {
       if (!this._sawWaiting) {
         this._sawWaiting = true;
         this.log('info', `[${this._elapsed()}] la trottinette attend l'appui sur Power (réponse 0)`);
+        ctx.prompt();
         // Tells the UI the vehicle is armed, so one short press is now enough.
         this.dispatchEvent(new Event('pairing-armed'));
       }
       return false;
     };
-    for (;;) {
-      const remaining = ctx.deadline - Date.now();
-      if (remaining <= 0) throw new ScooterError('TIMEOUT', 'Power non confirmé.');
-      try {
-        await this._repeatUntil(frame, match, {
-          // Keep asking for the whole window once the encoding is known to work: bailing
-          // out early is what kept restarting the prompt between the user's presses.
-          timeoutMs: answered || variantConfirmed ? remaining : Math.min(remaining, SET_PWD_SILENT_MS),
-          intervalMs: SET_PWD_RESEND_MS[variant],
-          onInvalid: () => { invalid++; },
-        });
-        break;
-      } catch (err) {
-        if (err.code !== 'TIMEOUT') throw err;
-        if (answered) continue;
-        if (invalid === 0) throw new ScooterError('SILENT', `Pas de réponse à SET_PWD (encodage ${variant}).`);
-        // The scooter answered but with a frame we cannot authenticate. Try AUTH
-        // anyway instead of discarding a possibly accepted password.
-        this.log('warn', `${invalid} réponse(s) SET_PWD illisible(s) : tentative d'AUTH quand même.`);
-        break;
+    const promptTimer = setTimeout(ctx.prompt, PROMPT_GRACE_MS);
+    try {
+      for (;;) {
+        const remaining = ctx.deadline - Date.now();
+        if (remaining <= 0) throw new ScooterError('TIMEOUT', 'Power non confirmé.');
+        try {
+          await this._repeatUntil(frame, match, {
+            // Keep asking for the whole window once the encoding is known to work: bailing
+            // out early is what kept restarting the prompt between the user's presses.
+            timeoutMs: answered || variantConfirmed ? remaining : Math.min(remaining, SET_PWD_SILENT_MS),
+            intervalMs: SET_PWD_RESEND_MS[variant],
+            onInvalid: () => { invalid++; },
+          });
+          break;
+        } catch (err) {
+          if (err.code !== 'TIMEOUT') throw err;
+          if (answered) continue;
+          if (invalid === 0) throw new ScooterError('SILENT', `Pas de réponse à SET_PWD (encodage ${variant}).`);
+          // The scooter answered but with a frame we cannot authenticate. Try AUTH
+          // anyway instead of discarding a possibly accepted password.
+          this.log('warn', `${invalid} réponse(s) SET_PWD illisible(s) : tentative d'AUTH quand même.`);
+          break;
+        }
       }
+    } finally {
+      clearTimeout(promptTimer);
     }
     this._mark(this._sawWaiting ? 'SET_PWD accepté (Power confirmé)' : 'SET_PWD accepté tout de suite');
     await sleep(250); // let the firmware commit the new key before the first AUTH frame

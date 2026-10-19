@@ -2,7 +2,8 @@ import { Scooter } from './scooter.js';
 import { BOARD, BOARD_NAMES, REG, MAX_SPEED_KMH, MIN_SPEED_KMH } from './registers.js';
 import { readU32 } from './protocol.js';
 import {
-  isValidSpeed, loadShortcuts, readAllModeSpeeds, runShortcut, saveCustomShortcuts, shortcutLabel,
+  isValidSpeed, loadShortcuts, readAllModeSpeeds, runShortcut, saveCustomShortcuts,
+  shortcutDescription, shortcutLabel,
 } from './shortcuts.js';
 import {
   SPEED_PROBES, clearSnapshots, diffSnapshots, formatSnapshot, loadSnapshot, readProbes,
@@ -10,7 +11,7 @@ import {
 } from './diagnostic.js';
 
 // Bumped on every deploy so you can check the phone shows the latest version.
-const APP_VERSION = '1.15.0';
+const APP_VERSION = '1.16.0';
 
 const $ = (id) => document.getElementById(id);
 const fmt = (v) => (v === null || v === undefined ? '–' : v);
@@ -19,6 +20,7 @@ const pairText = (bytes) => (bytes ? `${bytes[0]} / ${bytes[1]}` : '–');
 const ui = {
   status: $('status'),
   unsupported: $('unsupported'),
+  connectCard: $('connect-card'),
   connect: $('btn-connect'),
   disconnect: $('btn-disconnect'),
   forget: $('btn-forget'),
@@ -28,7 +30,7 @@ const ui = {
   refresh: $('btn-refresh'),
   battery: $('stat-battery'),
   mileage: $('stat-mileage'),
-  gear: $('stat-gear'),
+  gearRaw: $('stat-gear-raw'),
   serial: $('stat-serial'),
   gearED: $('gear-ED'),
   gearSR: $('gear-SR'),
@@ -57,6 +59,8 @@ const ui = {
   pairing: $('pairing'),
   pairingArmed: $('pairing-armed'),
   toast: $('toast'),
+  debug: $('debug'),
+  debugToggle: $('btn-debug'),
 };
 
 // ------------------------------------------------------------------ log
@@ -141,9 +145,8 @@ scooter.addEventListener('disconnected', () => {
 function updateConnectionUi() {
   const on = scooter.connected;
   setStatus(on ? 'on' : 'off', on ? 'Connectée' : 'Déconnectée');
-  ui.connect.hidden = on;
+  ui.connectCard.hidden = on;
   ui.connect.disabled = busy || !Scooter.isSupported();
-  ui.disconnect.hidden = !on;
   ui.dashboard.hidden = !on;
   document.querySelectorAll('.shortcut .run').forEach((b) => { b.disabled = !on || busy; });
   [ui.diagA, ui.diagB, ui.diagSweep, ui.writeReg].forEach((b) => { b.disabled = !on || busy; });
@@ -159,7 +162,7 @@ async function refreshDashboard() {
   ui.mileage.textContent = mileage === null ? '?' : `${(mileage / 100).toFixed(1)} km`;
 
   const gear = await scooter.readU16(BOARD.VCU, REG.GEAR_MODE).catch(() => null);
-  ui.gear.textContent = gear === null ? '?' : `brut ${gear}`;
+  ui.gearRaw.textContent = fmt(gear);
 
   const speeds = await readAllModeSpeeds(scooter);
   const pairs = {};
@@ -230,8 +233,9 @@ function renderShortcuts() {
     run.type = 'button';
     run.className = 'btn btn-primary run';
     run.textContent = shortcutLabel(sc);
+    run.setAttribute('aria-label', `Régler le ${shortcutDescription(sc)}`);
     run.addEventListener('click', () => withBusy(run, async () => {
-      log('info', `Raccourci : ${shortcutLabel(sc)}`);
+      log('info', `Raccourci : ${shortcutDescription(sc)}`);
       const result = await runShortcut(scooter, sc, log);
       const msg = result.refused
         ? `Mode ${sc.mode} : ${result.requested} km/h refusé, la trottinette garde ${fmt(result.kmh)} km/h`
@@ -248,8 +252,8 @@ function renderShortcuts() {
       const del = document.createElement('button');
       del.type = 'button';
       del.className = 'btn del';
-      del.textContent = 'Suppr.';
-      del.setAttribute('aria-label', `Supprimer le raccourci ${shortcutLabel(sc)}`);
+      del.textContent = '✕';
+      del.setAttribute('aria-label', `Supprimer le raccourci ${shortcutDescription(sc)}`);
       del.addEventListener('click', () => {
         shortcuts = shortcuts.filter((s) => s.id !== sc.id);
         saveCustomShortcuts(shortcuts);
@@ -400,6 +404,26 @@ ui.writeReg.addEventListener('click', () => withBusy(ui.writeReg, async () => {
   toast(read === value ? `${where} = ${value}` : `${where} relu à ${fmt(read)}`, read === value ? 'ok' : 'error');
 }));
 
+// ------------------------------------------------------------------ debug mode
+
+const DEBUG_KEY = 'zt3:debug';
+
+function setDebugMode(on) {
+  ui.debug.hidden = !on;
+  ui.debugToggle.setAttribute('aria-pressed', String(on));
+  ui.debugToggle.textContent = on ? 'Masquer le débogage' : 'Débogage';
+  try {
+    if (on) localStorage.setItem(DEBUG_KEY, '1');
+    else localStorage.removeItem(DEBUG_KEY);
+  } catch { /* private mode */ }
+}
+
+ui.debugToggle.addEventListener('click', () => {
+  const on = ui.debug.hidden;
+  setDebugMode(on);
+  if (on) ui.debug.scrollIntoView({ behavior: 'smooth', block: 'start' });
+});
+
 // ------------------------------------------------------------------ log controls
 
 ui.logDebug.addEventListener('change', renderLog);
@@ -437,5 +461,10 @@ function showLastNameHint() {
 $('app-version').textContent = APP_VERSION;
 showLastNameHint();
 showSnapshotSummary();
+try {
+  setDebugMode(localStorage.getItem(DEBUG_KEY) === '1');
+} catch {
+  setDebugMode(false);
+}
 renderShortcuts();
 log('info', `Prêt (version ${APP_VERSION}).`);

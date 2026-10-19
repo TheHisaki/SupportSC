@@ -9,167 +9,131 @@
 </head>
 <body>
   <header class="topbar">
-    <h1>ZT3 Control</h1>
-    <span id="status" class="pill pill-off" role="status" aria-live="polite">Déconnecté</span>
+    <h1>ZT3</h1>
+    <span id="status" class="pill pill-off" role="status" aria-live="polite">Déconnectée</span>
   </header>
 
   <main>
     <section id="unsupported" class="card warn" hidden>
       <h2>Bluetooth indisponible</h2>
-      <p>Ce navigateur ne gère pas le Web Bluetooth. Sur iPhone, ouvre ce site dans l'appli <strong>Bluefy</strong>. Sur Android ou PC, utilise Chrome.</p>
+      <p>Sur iPhone, ouvre ce site dans l'appli <strong>Bluefy</strong>. Sur Android ou PC, dans Chrome.</p>
     </section>
 
-    <section class="card" aria-labelledby="connect-title">
-      <h2 id="connect-title">Connexion</h2>
-      <ol class="steps">
-        <li>Ferme complètement les autres applis de trottinette (Segway, ScooterHacking…) : tant qu'une appli est connectée, la trottinette n'apparaît nulle part ailleurs.</li>
-        <li>Allume la trottinette.</li>
-        <li>Appuie sur « Connecter ». Dans la liste, ta trottinette s'affiche avec son <strong>numéro de série</strong> (14 caractères, ex. <code>1K1UA2532P0220</code>)<span id="last-name-hint"></span>.</li>
-        <li>Appuie brièvement sur le bouton Power quand le site te le demande. C'est redemandé chaque fois que tu as rouvert l'appli Segway entre-temps : la trottinette ne garde qu'une seule clé d'appairage, et l'appli Segway écrase la nôtre.</li>
-      </ol>
-      <div class="row">
-        <button id="btn-connect" class="btn btn-primary" type="button">Connecter la trottinette</button>
-        <button id="btn-disconnect" class="btn" type="button" hidden>Déconnecter</button>
-      </div>
-      <details class="advanced">
-        <summary>Options avancées</summary>
-        <label for="name-override">Nom Bluetooth (si la connexion échoue)</label>
-        <input id="name-override" type="text" autocomplete="off" autocapitalize="characters" spellcheck="false" placeholder="Numéro de série, ex. 1K1UA2532P0220">
-        <p class="hint">Ce nom sert de clé de chiffrement. Laisse vide pour utiliser le nom détecté.</p>
-        <button id="btn-forget" class="btn btn-small" type="button">Oublier l'appairage enregistré</button>
-      </details>
+    <section id="connect-card" class="card">
+      <button id="btn-connect" class="btn btn-primary btn-big" type="button">Connecter</button>
+      <p class="hint">Allume la trottinette et ferme l'appli Segway<span id="last-name-hint"></span>.</p>
     </section>
 
-    <section id="dashboard" class="card" aria-labelledby="dash-title" hidden>
-      <div class="card-head">
-        <h2 id="dash-title">Trottinette</h2>
-        <button id="btn-refresh" class="btn btn-small" type="button">Actualiser</button>
-      </div>
+    <section id="dashboard" class="card" aria-label="État de la trottinette" hidden>
       <dl class="stats">
         <div><dt>Batterie</dt><dd id="stat-battery">–</dd></div>
         <div><dt>Compteur</dt><dd id="stat-mileage">–</dd></div>
-        <div><dt>Mode actuel</dt><dd id="stat-gear">–</dd></div>
-        <div><dt>N° de série</dt><dd id="stat-serial">–</dd></div>
       </dl>
-      <h3>Vitesse max par mode</h3>
-      <dl class="stats stats-modes">
+      <dl class="stats stats-3 stats-speeds">
         <div><dt>E</dt><dd id="speed-E">–</dd></div>
         <div><dt>D</dt><dd id="speed-D">–</dd></div>
         <div><dt>S</dt><dd id="speed-S">–</dd></div>
       </dl>
-      <h3>Registres de vitesse</h3>
-      <dl class="stats">
-        <div><dt>Gear E/D — 0x47</dt><dd id="gear-ED">–</dd></div>
-        <div><dt>Gear S/R — 0x48</dt><dd id="gear-SR">–</dd></div>
-      </dl>
-      <p class="hint">Deux vitesses par registre, une par octet, en km/h entiers. Le mode S est l'octet de droite de 0x48.</p>
+      <div class="row row-end">
+        <button id="btn-refresh" class="btn btn-small" type="button">Actualiser</button>
+        <button id="btn-disconnect" class="btn btn-small" type="button">Déconnecter</button>
+      </div>
     </section>
 
     <section class="card" aria-labelledby="shortcuts-title">
-      <h2 id="shortcuts-title">Raccourcis</h2>
+      <h2 id="shortcuts-title" class="sr-only">Raccourcis</h2>
       <ul id="shortcut-list" class="shortcuts"></ul>
-
-      <form id="shortcut-form" class="shortcut-form">
-        <h3>Nouveau raccourci vitesse</h3>
-        <div class="row">
-          <div class="field">
-            <label for="sc-mode">Mode</label>
-            <select id="sc-mode">
-              <option value="E">E (Eco)</option>
-              <option value="D">D (Standard)</option>
-              <option value="S" selected>S (Sport)</option>
-            </select>
-          </div>
-          <div class="field">
-            <label for="sc-speed">Vitesse (km/h)</label>
-            <input id="sc-speed" type="number" inputmode="numeric" min="0" max="100" step="1" value="25" required>
-          </div>
-        </div>
-        <button class="btn" type="submit">Ajouter</button>
-        <p class="hint">N'importe quelle valeur de 0 à 100 est acceptée. La trottinette annonce ses propres limites (40 km/h max en mode S) : si elle refuse, le site te dit la valeur qu'elle a gardée. Au-delà de 25 km/h, la circulation sur la voie publique n'est pas autorisée en France.</p>
-      </form>
+      <details class="adder">
+        <summary>Ajouter un raccourci</summary>
+        <form id="shortcut-form" class="row row-add">
+          <select id="sc-mode" aria-label="Mode">
+            <option value="E">E</option>
+            <option value="D">D</option>
+            <option value="S" selected>S</option>
+          </select>
+          <input id="sc-speed" type="number" inputmode="numeric" min="0" max="100" step="1" value="25" required aria-label="Vitesse en km/h">
+          <button class="btn" type="submit">OK</button>
+        </form>
+      </details>
     </section>
 
-    <section class="card" aria-labelledby="diag-title">
-      <details>
-        <summary id="diag-title">Diagnostic vitesse</summary>
-        <p class="hint">Le registre du mode S est identifié : <code>VCU 0x48</code>, octet de droite, en km/h entiers. Cette section sert à vérifier un autre réglage : instantané avant, instantané après l'avoir changé dans l'appli Segway, puis comparaison.</p>
-        <ol class="steps">
-          <li>Règle la valeur dans l'appli Segway, puis ferme complètement l'appli.</li>
-          <li>Connecte-toi ici, saisis cette valeur ci-dessous, « Instantané A ».</li>
-          <li>Change-la dans l'appli Segway, ferme l'appli, reconnecte-toi ici, « Instantané B ».</li>
-          <li>« Comparer A et B » liste uniquement les octets qui ont bougé. Les instantanés sont gardés même si la page se recharge.</li>
-        </ol>
+    <div id="debug" hidden>
+      <section class="card">
+        <h2>Connexion</h2>
+        <label for="name-override">Nom Bluetooth (numéro de série)</label>
+        <input id="name-override" type="text" autocomplete="off" autocapitalize="characters" spellcheck="false" placeholder="1K1UA2532P0220">
         <div class="row">
-          <div class="field">
-            <label for="diag-needle">Valeur réglée dans l'appli Segway (km/h)</label>
-            <input id="diag-needle" type="number" inputmode="numeric" min="1" max="100" step="1" placeholder="20">
-          </div>
+          <button id="btn-forget" class="btn btn-small" type="button">Oublier l'appairage</button>
         </div>
+        <dl class="stats">
+          <div><dt>N° de série</dt><dd id="stat-serial">–</dd></div>
+          <div><dt>rGearMode — 0x5A</dt><dd id="stat-gear-raw">–</dd></div>
+          <div><dt>Gear E/D — 0x47</dt><dd id="gear-ED">–</dd></div>
+          <div><dt>Gear S/R — 0x48</dt><dd id="gear-SR">–</dd></div>
+        </dl>
+      </section>
+
+      <section class="card">
+        <h2>Diagnostic vitesse</h2>
+        <p class="hint">Instantané avant et après un changement dans l'appli Segway, puis comparaison : les octets qui bougent sont le réglage.</p>
+        <label for="diag-needle">Valeur réglée dans l'appli Segway (km/h)</label>
+        <input id="diag-needle" type="number" inputmode="numeric" min="1" max="100" step="1" placeholder="20">
         <p id="diag-state" class="hint"></p>
         <div class="row">
           <button id="btn-diag-a" class="btn btn-small" type="button">Instantané A</button>
           <button id="btn-diag-b" class="btn btn-small" type="button">Instantané B</button>
-          <button id="btn-diag-diff" class="btn btn-small" type="button">Comparer A et B</button>
+          <button id="btn-diag-diff" class="btn btn-small" type="button">Comparer</button>
         </div>
         <div class="row">
-          <button id="btn-diag-sweep" class="btn btn-small" type="button">Scan complet VCU</button>
-          <button id="btn-diag-copy" class="btn btn-small" type="button">Copier le résultat</button>
-          <button id="btn-diag-reset" class="btn btn-small" type="button">Effacer A et B</button>
+          <button id="btn-diag-sweep" class="btn btn-small" type="button">Scan VCU</button>
+          <button id="btn-diag-copy" class="btn btn-small" type="button">Copier</button>
+          <button id="btn-diag-reset" class="btn btn-small" type="button">Effacer A/B</button>
         </div>
         <pre id="diag-out" class="log" aria-live="off"></pre>
-        <details class="advanced">
-          <summary>Écrire un registre à la main (expert)</summary>
-          <p class="hint">À utiliser seulement pour tester un registre identifié, ou pour remettre une valeur d'origine (ex. VCU <code>6E</code> = <code>2</code>). Une valeur au hasard peut dérégler la trottinette.</p>
-          <div class="row">
-            <div class="field">
-              <label for="w-board">Carte</label>
-              <select id="w-board">
-                <option value="22">VCU (0x16)</option>
-                <option value="2">MCU (0x02)</option>
-              </select>
-            </div>
-            <div class="field">
-              <label for="w-reg">Registre (hex)</label>
-              <input id="w-reg" type="text" inputmode="latin" autocapitalize="off" spellcheck="false" placeholder="48">
-            </div>
-            <div class="field">
-              <label for="w-value">Valeur (décimal)</label>
-              <input id="w-value" type="number" inputmode="numeric" min="0" max="65535" step="1">
-            </div>
-          </div>
-          <label class="inline"><input id="w-nr" type="checkbox"> Écriture sans accusé de réception (writeNR)</label>
-          <button id="btn-write-reg" class="btn btn-small" type="button">Écrire ce registre</button>
-        </details>
-      </details>
-    </section>
+      </section>
 
-    <section class="card" aria-labelledby="log-title">
-      <details>
-        <summary id="log-title">Journal technique</summary>
-        <label class="inline"><input id="log-debug" type="checkbox"> Afficher les trames (debug)</label>
+      <section class="card">
+        <h2>Écriture manuelle</h2>
+        <p class="hint">Une valeur au hasard peut dérégler la trottinette.</p>
+        <div class="row row-add">
+          <select id="w-board" aria-label="Carte">
+            <option value="22">VCU</option>
+            <option value="2">MCU</option>
+          </select>
+          <input id="w-reg" type="text" inputmode="latin" autocapitalize="off" spellcheck="false" placeholder="48" aria-label="Registre en hexadécimal">
+          <input id="w-value" type="number" inputmode="numeric" min="0" max="65535" step="1" placeholder="25" aria-label="Valeur décimale">
+        </div>
+        <label class="inline"><input id="w-nr" type="checkbox"> Sans accusé (writeNR)</label>
+        <button id="btn-write-reg" class="btn btn-small" type="button">Écrire</button>
+      </section>
+
+      <section class="card">
+        <h2>Journal</h2>
+        <label class="inline"><input id="log-debug" type="checkbox"> Trames brutes</label>
         <pre id="log" class="log" aria-live="off"></pre>
         <div class="row">
-          <button id="btn-copy-log" class="btn btn-small" type="button">Copier le journal</button>
+          <button id="btn-copy-log" class="btn btn-small" type="button">Copier</button>
           <button id="btn-clear-log" class="btn btn-small" type="button">Effacer</button>
         </div>
-      </details>
-    </section>
+      </section>
+    </div>
   </main>
 
   <div id="pairing" class="overlay" role="alertdialog" aria-modal="true" aria-labelledby="pairing-title" hidden>
     <div class="overlay-box">
-      <h2 id="pairing-title">Confirme sur la trottinette</h2>
-      <p>Fais un appui <strong>court</strong> sur le bouton Power de la trottinette pour autoriser l'appairage (pas d'appui long, ça l'éteindrait).</p>
-      <p id="pairing-armed" class="armed" hidden>La trottinette a confirmé qu'elle attend : <strong>un seul appui court</strong> suffit maintenant.</p>
-      <p class="hint">La connexion reste ouverte pendant 60 secondes. Si rien ne se passe après quelques secondes, refais un appui court. Normal après un passage par l'appli Segway : elle a remplacé notre clé dans la trottinette.</p>
+      <h2 id="pairing-title">Appui sur Power</h2>
+      <p>Un appui <strong>court</strong> sur le bouton Power de la trottinette.</p>
+      <p id="pairing-armed" class="armed" hidden>Elle attend : un seul appui suffit.</p>
       <div class="spinner" aria-hidden="true"></div>
     </div>
   </div>
 
   <div id="toast" class="toast" role="status" aria-live="assertive" hidden></div>
 
-  <footer class="footer">Version <span id="app-version"></span></footer>
+  <footer class="footer">
+    <button id="btn-debug" class="link-btn" type="button" aria-pressed="false">Débogage</button>
+    <span id="app-version"></span>
+  </footer>
 
   <script type="module" src="js/app.js"></script>
 </body>
