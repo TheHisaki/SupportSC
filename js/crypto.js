@@ -211,6 +211,11 @@ export class NbCrypto {
     this.counter = 1;
   }
 
+  /** Forces the counter of the next encrypted frame (encrypt pre-increments). */
+  setNextCounter(value) {
+    this.counter = Math.max(0, value - 1);
+  }
+
   resetSn() {
     this.counter = 0;
   }
@@ -256,7 +261,6 @@ export class NbCrypto {
     let base = this.counter;
     if ((base & 0x8000) && !(recv16 & 0x8000)) base += 0x10000;
     const counter = recv16 === 0 ? 0 : ((base & ~0xffff) | recv16) >>> 0;
-    if (counter > 0 && this.followPeer) this.counter = counter;
 
     if (counter > 0) {
       const nonce = buildNonce(counter, auth);

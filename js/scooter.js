@@ -290,7 +290,8 @@ export class Scooter extends EventTarget {
     if (stored && pre.index !== 0) {
       if (this.crypto.counter === 0) this.crypto.startSn();
       this.crypto.setKey(fromHex(stored), this._auth);
-      if (await this._sendAuth('AUTH avec le mot de passe enregistré (sans bouton)')) return;
+      if (await this._sendAuth('AUTH avec le mot de passe enregistré (sans bouton)',
+        { targets: [BOARD_AUTH, BOARD_BLE], counters: [2, 3] })) return;
       storage.remove(`zt3:pwd:${this.serial}`);
       this.log('warn', 'Mot de passe enregistré refusé, nouvel appairage.');
     }
@@ -307,6 +308,7 @@ export class Scooter extends EventTarget {
     this._mark(`SET_PWD (encodage ${variant}) — appuie sur Power`);
     const frame = buildFrame(SYNC2, BOARD_AUTH, CMD.SET_PWD, 0x00, password);
     let answered = false;
+    let invalid = 0;
     const match = (f) => {
       if (f.cmd !== CMD.SET_PWD && f.cmd !== CMD.READ_ACK) return false;
       answered = true;
@@ -324,11 +326,17 @@ export class Scooter extends EventTarget {
         await this._repeatUntil(frame, match, {
           timeoutMs: answered ? remaining : Math.min(remaining, SET_PWD_SILENT_MS),
           intervalMs: SET_PWD_RESEND_MS[variant],
+          onInvalid: () => { invalid++; },
         });
         break;
       } catch (err) {
         if (err.code !== 'TIMEOUT') throw err;
-        if (!answered) throw new ScooterError('SILENT', `Pas de réponse à SET_PWD (encodage ${variant}).`);
+        if (answered) continue;
+        if (invalid === 0) throw new ScooterError('SILENT', `Pas de réponse à SET_PWD (encodage ${variant}).`);
+        // The scooter answered but with a frame we cannot authenticate. Try AUTH
+        // anyway instead of discarding a possibly accepted password.
+        this.log('warn', `${invalid} réponse(s) SET_PWD illisible(s) : tentative d'AUTH quand même.`);
+        break;
       }
     }
     this._mark(this._sawWaiting ? 'SET_PWD accepté (Power confirmé)' : 'SET_PWD accepté tout de suite');
@@ -337,33 +345,39 @@ export class Scooter extends EventTarget {
     if (variant === 'legacy' && this.crypto.counter === 0) this.crypto.startSn();
 
     this.crypto.setKey(password, this._auth);
-    const authTargets = variant === 'legacy' ? [BOARD_AUTH, BOARD_BLE] : [BOARD_AUTH];
-    if (!(await this._sendAuth('AUTH', authTargets))) {
+    // Documented X3 behaviour: the first SN frame after a non-SN SET_PWD uses
+    // counter 2, while a SN SET_PWD already consumed 2 so AUTH uses 3.
+    const counters = variant === 'legacy' ? [2, 3] : [3, 2];
+    if (!(await this._sendAuth('AUTH', { targets: [BOARD_AUTH, BOARD_BLE], counters }))) {
       throw new ScooterError('AUTH_REFUSED', 'AUTH refusée par la trottinette.');
     }
     storage.set(`zt3:pwd:${this.serial}`, toHex(password, ''));
   }
 
   /** Sends AUTH (serial number) with the current key. Returns true if accepted. */
-  async _sendAuth(label, targets = [BOARD_AUTH]) {
-    for (const target of targets) {
-      this._mark(target === BOARD_AUTH ? label : `${label} → carte 0x${target.toString(16)}`);
-      let res;
-      try {
-        res = await this._repeatUntil(buildFrame(SYNC2, target, CMD.AUTH, 0x00, this._sn),
-          (f) => f.cmd === CMD.AUTH || f.cmd === CMD.READ_ACK,
-          { timeoutMs: AUTH_RESEND_MS * AUTH_TRIES, intervalMs: AUTH_RESEND_MS });
-      } catch (err) {
-        if (err.code !== 'TIMEOUT') throw err;
-        this.log('debug', `[${this._elapsed()}] AUTH sans réponse sur 0x${target.toString(16)}.`);
-        continue;
+  async _sendAuth(label, { targets = [BOARD_AUTH], counters = [null] } = {}) {
+    for (const counter of counters) {
+      for (const target of targets) {
+        if (counter !== null) this.crypto.setNextCounter(counter);
+        const where = `carte 0x${target.toString(16)}${counter === null ? '' : `, compteur ${counter}`}`;
+        this._mark(`${label} (${where})`);
+        let res;
+        try {
+          res = await this._repeatUntil(buildFrame(SYNC2, target, CMD.AUTH, 0x00, this._sn),
+            (f) => f.cmd === CMD.AUTH || f.cmd === CMD.READ_ACK,
+            { timeoutMs: AUTH_RESEND_MS * AUTH_TRIES, intervalMs: AUTH_RESEND_MS });
+        } catch (err) {
+          if (err.code !== 'TIMEOUT') throw err;
+          this.log('debug', `[${this._elapsed()}] AUTH sans réponse (${where}).`);
+          continue;
+        }
+        if (res.index !== 1) {
+          this.log('warn', `[${this._elapsed()}] AUTH : réponse ${res.index} (${where})`);
+          continue;
+        }
+        this._mark('authentifié');
+        return true;
       }
-      if (res.index !== 1) {
-        this.log('warn', `[${this._elapsed()}] AUTH : réponse ${res.index} sur 0x${target.toString(16)}`);
-        continue;
-      }
-      this._mark('authentifié');
-      return true;
     }
     return false;
   }
@@ -400,6 +414,7 @@ export class Scooter extends EventTarget {
     this._rxQueue = [];
     this._lastRx = null;
     this.authWriteChar = null;
+    this._mustChunk = false; // MTU is renegotiated on every connection
     this._mark('connexion GATT');
     const server = await this.device.gatt.connect();
     this._mark('GATT connecté, recherche du service');
@@ -537,19 +552,39 @@ export class Scooter extends EventTarget {
     });
   }
 
+  async _writeRaw(ch, data) {
+    if (ch.properties?.writeWithoutResponse && ch.writeValueWithoutResponse) {
+      await ch.writeValueWithoutResponse(data);
+    } else if (ch.writeValueWithResponse) {
+      await ch.writeValueWithResponse(data);
+    } else {
+      await ch.writeValue(data);
+    }
+  }
+
   async _write(bytes) {
     if (this._gattLost) throw new ScooterError('DISCONNECTED', 'Connexion Bluetooth perdue.');
     this.log('debug', `TX ${toHex(bytes)}`);
     const ch = this.writeChar;
-    for (let off = 0; off < bytes.length; off += CHUNK_SIZE) {
-      const chunk = bytes.slice(off, off + CHUNK_SIZE);
-      if (ch.properties?.writeWithoutResponse && ch.writeValueWithoutResponse) {
-        await ch.writeValueWithoutResponse(chunk);
-      } else if (ch.writeValueWithResponse) {
-        await ch.writeValueWithResponse(chunk);
-      } else {
-        await ch.writeValue(chunk);
+
+    // The official app and ScooterHacking Utility write every frame in a single
+    // ATT operation. x3 firmwares drop frames split across several writes, which
+    // is why PRE_COMM (13 bytes, one write) worked while SET_PWD (29 bytes) and
+    // AUTH (27 bytes) never did. Only fall back to chunking if the engine
+    // refuses the full-length write.
+    if (!this._mustChunk) {
+      try {
+        await this._writeRaw(ch, bytes);
+        return;
+      } catch (err) {
+        if (this._gattLost) throw err;
+        this._mustChunk = true;
+        this.log('warn', `Écriture en un bloc refusée (${err.message}) : fragmentation ${CHUNK_SIZE} o.`);
       }
+    }
+
+    for (let off = 0; off < bytes.length; off += CHUNK_SIZE) {
+      await this._writeRaw(ch, bytes.slice(off, off + CHUNK_SIZE));
       if (off + CHUNK_SIZE < bytes.length) await sleep(10);
     }
   }
@@ -594,7 +629,7 @@ export class Scooter extends EventTarget {
    * Sends `plainFrame` (re-encrypted each time) every `intervalMs` until a response matches,
    * like the official app does for SET_PWD / AUTH. `burst` copies are sent on the first round.
    */
-  async _repeatUntil(plainFrame, match, { timeoutMs, intervalMs = 500, burst = 1 }) {
+  async _repeatUntil(plainFrame, match, { timeoutMs, intervalMs = 500, burst = 1, onInvalid = null }) {
     this._rxQueue = [];
     const deadline = Date.now() + timeoutMs;
     let nextSend = 0;
@@ -615,6 +650,7 @@ export class Scooter extends EventTarget {
       const { plain, ok } = await this.crypto.decrypt(raw);
       if (!ok) {
         this.log('debug', `Contrôle d'intégrité invalide sur ${toHex(plain)}`);
+        onInvalid?.(raw);
         continue;
       }
       const frame = parseFrame(plain);
