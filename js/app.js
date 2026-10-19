@@ -1,14 +1,18 @@
 import { Scooter } from './scooter.js';
-import { BOARD, REG, MAX_SPEED_KMH, MIN_SPEED_KMH } from './registers.js';
+import { BOARD, BOARD_NAMES, REG, MAX_SPEED_KMH, MIN_SPEED_KMH } from './registers.js';
 import { readU32 } from './protocol.js';
 import {
   isValidSpeed, loadShortcuts, readAllModeSpeeds, runShortcut, saveCustomShortcuts, shortcutLabel,
 } from './shortcuts.js';
+import {
+  SPEED_PROBES, diffSnapshots, formatSnapshot, readAllGearFamilies, readProbes, sweepBoard,
+} from './diagnostic.js';
 
 // Bumped on every deploy so you can check the phone shows the latest version.
-const APP_VERSION = '1.12.0';
+const APP_VERSION = '1.13.0';
 
 const $ = (id) => document.getElementById(id);
+const fmt = (v) => (v === null || v === undefined ? '–' : v);
 
 const ui = {
   status: $('status'),
@@ -24,10 +28,24 @@ const ui = {
   mileage: $('stat-mileage'),
   gear: $('stat-gear'),
   serial: $('stat-serial'),
+  gearED: $('gear-ED'),
+  gearSR: $('gear-SR'),
   shortcutList: $('shortcut-list'),
   shortcutForm: $('shortcut-form'),
   scMode: $('sc-mode'),
   scSpeed: $('sc-speed'),
+  diagNeedle: $('diag-needle'),
+  diagA: $('btn-diag-a'),
+  diagB: $('btn-diag-b'),
+  diagDiff: $('btn-diag-diff'),
+  diagSweep: $('btn-diag-sweep'),
+  diagCopy: $('btn-diag-copy'),
+  diagOut: $('diag-out'),
+  wBoard: $('w-board'),
+  wReg: $('w-reg'),
+  wValue: $('w-value'),
+  wNoReply: $('w-nr'),
+  writeReg: $('btn-write-reg'),
   log: $('log'),
   logDebug: $('log-debug'),
   copyLog: $('btn-copy-log'),
@@ -43,7 +61,7 @@ const logLines = [];
 function log(level, message) {
   const time = new Date().toLocaleTimeString('fr-FR');
   logLines.push({ level, text: `[${time}] ${level.toUpperCase()} ${message}` });
-  if (logLines.length > 600) logLines.shift();
+  if (logLines.length > 2000) logLines.shift();
   if (level === 'debug' && !ui.logDebug.checked) return;
   appendLogLine(logLines[logLines.length - 1]);
 }
@@ -118,6 +136,7 @@ function updateConnectionUi() {
   ui.disconnect.hidden = !on;
   ui.dashboard.hidden = !on;
   document.querySelectorAll('.shortcut .run').forEach((b) => { b.disabled = !on || busy; });
+  [ui.diagA, ui.diagB, ui.diagSweep, ui.writeReg].forEach((b) => { b.disabled = !on || busy; });
 }
 
 async function refreshDashboard() {
@@ -139,6 +158,21 @@ async function refreshDashboard() {
     else if (s.kmh !== null) el.textContent = `${s.kmh} km/h`;
     else el.textContent = `brut ${s.raw}`;
     log('info', s.error ? `Mode ${key} : ${s.error}` : `Mode ${key} : brut ${s.raw}${s.scale ? ` → ${s.kmh} km/h` : ''}`);
+  }
+
+  const families = await readAllGearFamilies(scooter);
+  for (const [key, f] of Object.entries(families)) {
+    const el = $(`gear-${key}`);
+    if (!el) continue;
+    if (f.error) {
+      el.textContent = '?';
+      log('warn', `${f.label} : ${f.error}`);
+      continue;
+    }
+    const range = `${fmt(f.min)}–${fmt(f.max)}`;
+    el.textContent = f.value === null ? '–' : `${f.value} (${range})`;
+    log('info', `${f.label} 0x${f.reg.toString(16)} = ${fmt(f.value)} (min ${fmt(f.min)}, max ${fmt(f.max)})`
+      + (f.usable ? ' — exploitable comme km/h' : ' — pas des km/h, non utilisé'));
   }
 }
 
@@ -194,8 +228,8 @@ function renderShortcuts() {
         ? `Mode ${sc.mode} réglé à ${result.kmh} km/h`
         : `Mode ${sc.mode} déjà à ${result.kmh} km/h`;
       toast(msg);
-      log('info', msg);
-      $(`speed-${sc.mode}`).textContent = `${result.kmh} km/h`;
+      log('info', `${msg} (via ${result.via})`);
+      await refreshDashboard();
     }));
     li.appendChild(run);
 
@@ -234,6 +268,103 @@ ui.shortcutForm.addEventListener('submit', (event) => {
   renderShortcuts();
   toast('Raccourci ajouté');
 });
+
+// ------------------------------------------------------------------ diagnostic
+
+const snapshots = { A: null, B: null };
+
+function setDiag(text) {
+  ui.diagOut.textContent = text;
+}
+
+/** Also pushed to the journal line by line, so "Copier le journal" carries the dump. */
+function reportDiag(title, body) {
+  const text = `${title}\n${body}`;
+  setDiag(text);
+  log('info', title);
+  body.split('\n').filter(Boolean).forEach((line) => log('info', line));
+}
+
+function diagNeedle() {
+  const v = Number(ui.diagNeedle.value);
+  return Number.isInteger(v) && v > 0 ? v : null;
+}
+
+async function takeSnapshot(slot) {
+  setDiag(`Lecture des registres (instantané ${slot})…`);
+  const snap = await readProbes(scooter, SPEED_PROBES, {
+    onProgress: (done, total) => setStatus('busy', `Lecture ${done}/${total}`),
+  });
+  snapshots[slot] = snap;
+  const needle = diagNeedle();
+  reportDiag(
+    `Instantané ${slot} — ${new Date(snap.at).toLocaleTimeString('fr-FR')}`
+    + (needle ? ` — recherche de ${needle} et ${needle * 10}` : ''),
+    formatSnapshot(snap, { needle }),
+  );
+}
+
+ui.diagA.addEventListener('click', () => withBusy(ui.diagA, () => takeSnapshot('A')));
+ui.diagB.addEventListener('click', () => withBusy(ui.diagB, () => takeSnapshot('B')));
+
+ui.diagDiff.addEventListener('click', () => {
+  if (!snapshots.A || !snapshots.B) {
+    toast('Il faut les deux instantanés A et B', 'error');
+    return;
+  }
+  const lines = diffSnapshots(snapshots.A, snapshots.B);
+  reportDiag(
+    'Différences A → B',
+    lines.length ? lines.join('\n') : 'Aucun registre lu n\'a changé : le réglage est ailleurs, lance un scan complet.',
+  );
+});
+
+ui.diagSweep.addEventListener('click', () => withBusy(ui.diagSweep, async () => {
+  setDiag('Scan complet du VCU (0x00 à 0xFF)… ça peut prendre une à deux minutes.');
+  const snap = await sweepBoard(scooter, BOARD.VCU, {
+    onProgress: (done, total) => setStatus('busy', `Scan ${done}/${total}`),
+  });
+  snapshots.sweep = snap;
+  const needle = diagNeedle();
+  reportDiag(
+    `Scan VCU — ${new Date(snap.at).toLocaleTimeString('fr-FR')}`
+    + (needle ? ` — recherche de ${needle} et ${needle * 10}` : ''),
+    formatSnapshot(snap, { needle, skipSilent: true }),
+  );
+}));
+
+ui.diagCopy.addEventListener('click', async () => {
+  const text = ui.diagOut.textContent;
+  if (!text.trim()) {
+    toast('Rien à copier', 'error');
+    return;
+  }
+  try {
+    await navigator.clipboard.writeText(text);
+    toast('Résultat copié');
+  } catch {
+    toast('Copie impossible, sélectionne le texte à la main', 'error');
+  }
+});
+
+ui.writeReg.addEventListener('click', () => withBusy(ui.writeReg, async () => {
+  const board = Number(ui.wBoard.value);
+  const reg = parseInt(ui.wReg.value.replace(/[^0-9a-f]/gi, ''), 16);
+  const value = Number(ui.wValue.value);
+  if (!Number.isInteger(reg) || reg < 0 || reg > 0xff) throw new Error('Registre invalide (2 chiffres hexa, ex. 48).');
+  if (!Number.isInteger(value) || value < 0 || value > 0xffff) throw new Error('Valeur invalide (0 à 65535).');
+
+  const noReply = ui.wNoReply.checked;
+  const where = `${BOARD_NAMES[board] ?? board} 0x${reg.toString(16).toUpperCase().padStart(2, '0')}`;
+  if (!window.confirm(`Écrire ${value} dans ${where}${noReply ? ' (sans accusé)' : ''} ?`)) return;
+
+  const acked = await scooter.writeU16(board, reg, value, { noReply });
+  log('info', `Écriture ${where} = ${value}${acked ? '' : ' (pas d\'accusé)'}`);
+  const back = await scooter.probeRegister(board, reg, 2);
+  const read = back && back.length >= 2 ? back[0] | (back[1] << 8) : null;
+  reportDiag(`Écriture manuelle ${where} = ${value}`, `relecture : ${fmt(read)}`);
+  toast(read === value ? `${where} = ${value}` : `${where} relu à ${fmt(read)}`, read === value ? 'ok' : 'error');
+}));
 
 // ------------------------------------------------------------------ log controls
 

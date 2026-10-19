@@ -710,11 +710,36 @@ export class Scooter extends EventTarget {
     return value;
   }
 
-  /** Writes a u16 value (cmd WRITE, waits for the ACK). Returns true if the scooter acknowledged. */
-  writeU16(board, reg, value) {
+  /**
+   * Diagnostic read: one attempt, short timeout, `null` when the register stays silent.
+   * Used to scan registers the vehicle may not implement without stalling on retries.
+   */
+  probeRegister(board, reg, len = 2, timeoutMs = 600) {
     return this._exclusive(async () => {
       this._ensureConnected();
-      const frame = buildFrame(this.sync2, board, CMD.WRITE, reg, u16le(value));
+      const frame = buildFrame(this.sync2, board, CMD.READ, reg, u16le(len));
+      try {
+        return (await this._transact(frame, (f) => f.cmd === CMD.READ_ACK && f.index === reg, timeoutMs)).data;
+      } catch (err) {
+        if (err.code === 'TIMEOUT') return null;
+        throw err;
+      }
+    });
+  }
+
+  /**
+   * Writes raw bytes to a register. `noReply` uses cmd WRITE_NR (0x03), which the firmware
+   * never acknowledges (that is how the official app sends setMaxSpeed / setFunBool).
+   * Returns true when acknowledged (or when no acknowledgement is expected).
+   */
+  writeRegister(board, reg, bytes, { noReply = false } = {}) {
+    return this._exclusive(async () => {
+      this._ensureConnected();
+      const frame = buildFrame(this.sync2, board, noReply ? CMD.WRITE_NR : CMD.WRITE, reg, bytes);
+      if (noReply) {
+        await this._write(await this.crypto.encrypt(frame));
+        return true;
+      }
       try {
         await this._transact(frame, (f) => f.cmd === CMD.WRITE_ACK && f.index === reg, 2500);
         return true;
@@ -726,5 +751,10 @@ export class Scooter extends EventTarget {
         throw err;
       }
     });
+  }
+
+  /** Writes a u16 value. Returns true if the scooter acknowledged. */
+  writeU16(board, reg, value, options) {
+    return this.writeRegister(board, reg, u16le(value), options);
   }
 }

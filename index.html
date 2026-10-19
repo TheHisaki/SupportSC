@@ -57,6 +57,11 @@
         <div><dt>D</dt><dd id="speed-D">–</dd></div>
         <div><dt>S</dt><dd id="speed-S">–</dd></div>
       </dl>
+      <h3>Registres de vitesse (plage acceptée par la trottinette)</h3>
+      <dl class="stats">
+        <div><dt>Gear E/D — 0x47</dt><dd id="gear-ED">–</dd></div>
+        <div><dt>Gear S/R — 0x48</dt><dd id="gear-SR">–</dd></div>
+      </dl>
     </section>
 
     <section class="card" aria-labelledby="shortcuts-title">
@@ -81,6 +86,58 @@
         </div>
         <button class="btn" type="submit">Ajouter</button>
       </form>
+    </section>
+
+    <section class="card" aria-labelledby="diag-title">
+      <details>
+        <summary id="diag-title">Diagnostic vitesse</summary>
+        <p class="hint">La trottinette expose plusieurs registres de vitesse et la documentation ne dit pas lequel limite réellement le moteur. Cette méthode le trouve à coup sûr :</p>
+        <ol class="steps">
+          <li>Dans l'appli Segway, règle la vitesse max du mode S sur une valeur précise (ex. <strong>20</strong>), puis ferme complètement l'appli.</li>
+          <li>Connecte-toi ici, saisis cette valeur ci-dessous et appuie sur « Instantané A ».</li>
+          <li>Retourne dans l'appli Segway, mets une autre valeur (ex. <strong>15</strong>), ferme-la, reconnecte-toi ici et appuie sur « Instantané B ».</li>
+          <li>« Comparer A et B » : le registre qui a changé est le vrai registre de vitesse. Copie le résultat.</li>
+        </ol>
+        <div class="row">
+          <div class="field">
+            <label for="diag-needle">Valeur réglée dans l'appli Segway (km/h)</label>
+            <input id="diag-needle" type="number" inputmode="numeric" min="1" max="100" step="1" placeholder="20">
+          </div>
+        </div>
+        <div class="row">
+          <button id="btn-diag-a" class="btn btn-small" type="button">Instantané A</button>
+          <button id="btn-diag-b" class="btn btn-small" type="button">Instantané B</button>
+          <button id="btn-diag-diff" class="btn btn-small" type="button">Comparer A et B</button>
+        </div>
+        <div class="row">
+          <button id="btn-diag-sweep" class="btn btn-small" type="button">Scan complet VCU</button>
+          <button id="btn-diag-copy" class="btn btn-small" type="button">Copier le résultat</button>
+        </div>
+        <pre id="diag-out" class="log" aria-live="off"></pre>
+        <details class="advanced">
+          <summary>Écrire un registre à la main (expert)</summary>
+          <p class="hint">À utiliser seulement pour tester un registre identifié, ou pour remettre une valeur d'origine (ex. VCU <code>6E</code> = <code>2</code>). Une valeur au hasard peut dérégler la trottinette.</p>
+          <div class="row">
+            <div class="field">
+              <label for="w-board">Carte</label>
+              <select id="w-board">
+                <option value="22">VCU (0x16)</option>
+                <option value="2">MCU (0x02)</option>
+              </select>
+            </div>
+            <div class="field">
+              <label for="w-reg">Registre (hex)</label>
+              <input id="w-reg" type="text" inputmode="latin" autocapitalize="off" spellcheck="false" placeholder="48">
+            </div>
+            <div class="field">
+              <label for="w-value">Valeur (décimal)</label>
+              <input id="w-value" type="number" inputmode="numeric" min="0" max="65535" step="1">
+            </div>
+          </div>
+          <label class="inline"><input id="w-nr" type="checkbox"> Écriture sans accusé de réception (writeNR)</label>
+          <button id="btn-write-reg" class="btn btn-small" type="button">Écrire ce registre</button>
+        </details>
+      </details>
     </section>
 
     <section class="card" aria-labelledby="log-title">
