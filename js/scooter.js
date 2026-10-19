@@ -1,7 +1,7 @@
 // Web Bluetooth connection + Ninebot Encryption2 handshake for the Segway ZT3 Pro.
 // Works in Bluefy (iOS) and Chrome (Android / desktop). Requires HTTPS.
 
-import { NbCrypto, FW_DATA, bytesEqual, fromHex, generatePairingPassword, toHex } from './crypto.js';
+import { NbCrypto, FW_DATA, bytesEqual, fromHex, generatePairingPassword, randomBytes, toHex } from './crypto.js';
 import { CMD, FrameAssembler, buildFrame, parseFrame, readU16, u16le } from './protocol.js';
 
 const NB_SERVICE = '6e400001-0000-0000-006e-696e65626f74';
@@ -165,6 +165,13 @@ export class Scooter extends EventTarget {
       for (;;) {
         try {
           const pre = await this._openAndPreComm();
+          // SHU-compatible path: a vehicle that already reports a stored
+          // password accepts the legacy app-random SET_PWD flow. It keeps
+          // the Segway account binding intact; do not force an unbind here.
+          if (pre.index !== 0 && !storage.get(`zt3:pwd:${this.serial}`) && variant === 'sn') {
+            variant = 'legacy';
+            this.log('info', 'Appairage existant détecté : essai du flux legacy compatible SHU.');
+          }
           await this._authenticate(pre, variant, ctx);
           storage.set(variantKey, variant);
           this._finishConnected();
@@ -281,28 +288,19 @@ export class Scooter extends EventTarget {
 
     const stored = storage.get(`zt3:pwd:${this.serial}`);
     if (stored && pre.index !== 0) {
+      if (this.crypto.counter === 0) this.crypto.startSn();
       this.crypto.setKey(fromHex(stored), this._auth);
       if (await this._sendAuth('AUTH avec le mot de passe enregistré (sans bouton)')) return;
       storage.remove(`zt3:pwd:${this.serial}`);
       this.log('warn', 'Mot de passe enregistré refusé, nouvel appairage.');
     }
 
-    // PRE_COMM index != 0 means the vehicle already has a stored pairing
-    // password. SET_PWD cannot replace that password merely by pressing Power;
-    // the owner must unbind it in the official Segway/Ninebot app first, or
-    // provide the password recovered from the owner's app backup.
-    if (pre.index !== 0) {
-      throw new ScooterError('BOUND',
-        "Cette ZT3 est déjà appairée (PRE_COMM index 1). Ouvre l’application Segway/Ninebot " +
-        "avec le compte lié, sélectionne la trottinette → menu ☰ → Dissocier/Unbind, " +
-        "confirme le code e-mail, ferme complètement l’application, puis réessaie. " +
-        "Un appui sur Power ne peut pas remplacer cet ancien mot de passe.");
-    }
-
-    // X3/ZT3 firmware derives the password from auth + current time using
-    // the Java-compatible generator used by the public reference clients.
-    // the Java-compatible generator used by the public reference clients.
-    const password = await generatePairingPassword(this._auth);
+    // X3/ZT3 legacy pairing uses a random app key for SET_PWD. This is the
+    // flow used by the public NinebotCrypto clients and by SHU-compatible
+    // firmware paths; keep the same 16 bytes for every retry in this session.
+    const password = variant === 'legacy'
+      ? randomBytes(16)
+      : await generatePairingPassword(this._auth);
     this.crypto.setKey(utf8(this.btName), this._auth);
     ctx.deadline ??= Date.now() + PAIRING_TIMEOUT_MS;
     ctx.prompt();
@@ -339,29 +337,35 @@ export class Scooter extends EventTarget {
     if (variant === 'legacy' && this.crypto.counter === 0) this.crypto.startSn();
 
     this.crypto.setKey(password, this._auth);
-    if (!(await this._sendAuth('AUTH'))) {
+    const authTargets = variant === 'legacy' ? [BOARD_AUTH, BOARD_BLE] : [BOARD_AUTH];
+    if (!(await this._sendAuth('AUTH', authTargets))) {
       throw new ScooterError('AUTH_REFUSED', 'AUTH refusée par la trottinette.');
     }
     storage.set(`zt3:pwd:${this.serial}`, toHex(password, ''));
   }
 
-  /** Sends AUTH (serial number) with the current key. Returns true if the scooter answers index 1. */
-  async _sendAuth(label) {
-    this._mark(label);
-    let res;
-    try {
-      res = await this._repeatUntil(buildFrame(SYNC2, BOARD_AUTH, CMD.AUTH, 0x00, this._sn),
-        (f) => f.cmd === CMD.AUTH || f.cmd === CMD.READ_ACK, { timeoutMs: AUTH_RESEND_MS * AUTH_TRIES, intervalMs: AUTH_RESEND_MS });
-    } catch (err) {
-      if (err.code !== 'TIMEOUT') throw err;
-      return false;
+  /** Sends AUTH (serial number) with the current key. Returns true if accepted. */
+  async _sendAuth(label, targets = [BOARD_AUTH]) {
+    for (const target of targets) {
+      this._mark(target === BOARD_AUTH ? label : `${label} → carte 0x${target.toString(16)}`);
+      let res;
+      try {
+        res = await this._repeatUntil(buildFrame(SYNC2, target, CMD.AUTH, 0x00, this._sn),
+          (f) => f.cmd === CMD.AUTH || f.cmd === CMD.READ_ACK,
+          { timeoutMs: AUTH_RESEND_MS * AUTH_TRIES, intervalMs: AUTH_RESEND_MS });
+      } catch (err) {
+        if (err.code !== 'TIMEOUT') throw err;
+        this.log('debug', `[${this._elapsed()}] AUTH sans réponse sur 0x${target.toString(16)}.`);
+        continue;
+      }
+      if (res.index !== 1) {
+        this.log('warn', `[${this._elapsed()}] AUTH : réponse ${res.index} sur 0x${target.toString(16)}`);
+        continue;
+      }
+      this._mark('authentifié');
+      return true;
     }
-    if (res.index !== 1) {
-      this.log('warn', `[${this._elapsed()}] AUTH : réponse ${res.index}`);
-      return false;
-    }
-    this._mark('authentifié');
-    return true;
+    return false;
   }
 
   /** Maps browser Bluetooth errors (e.g. "GATT Server is disconnected") to ScooterError codes. */
